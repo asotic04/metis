@@ -22,7 +22,6 @@ from .commands import (
 )
 from .utils import print_console
 
-
 InvocationMode = Literal["none", "path", "question", "index", "args", "meta"]
 IndexPolicy = Literal["none", "required", "optional"]
 
@@ -36,6 +35,7 @@ class CommandSpec:
     prepares_output_file: bool = False
     index_policy: IndexPolicy = "none"
     supports_triage: bool = False
+    supports_llm_triage: bool = False
 
     def usage_target(self, cmd_args: list[str]) -> str | None:
         if self.invocation_mode == "path" and cmd_args:
@@ -68,6 +68,17 @@ class CommandSpec:
         ):
             print_console(
                 "[red]Error:[/red] --triage can only be used with review_code, review_file, or review_patch.",
+                args.quiet,
+            )
+            return False
+        llm_triage_requested = bool(getattr(args, "llm_triage", False))
+        if (
+            llm_triage_requested
+            and strict_triage_validation
+            and not self.supports_llm_triage
+        ):
+            print_console(
+                "[red]Error:[/red] --llm-triage can only be used with review_code or review_file.",
                 args.quiet,
             )
             return False
@@ -129,6 +140,7 @@ COMMANDS = {
         prepares_output_file=True,
         index_policy="optional",
         supports_triage=True,
+        supports_llm_triage=True,
     ),
     "update": CommandSpec(
         run_update,
@@ -144,6 +156,7 @@ COMMANDS = {
         prepares_output_file=True,
         index_policy="optional",
         supports_triage=True,
+        supports_llm_triage=True,
     ),
     "ask": CommandSpec(
         run_ask,

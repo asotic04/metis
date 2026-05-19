@@ -362,6 +362,34 @@ def main():
         help="Include findings already triaged by Metis when running triage.",
     )
     parser.add_argument(
+        "--llm-triage",
+        action="store_true",
+        help="After review_file or review_code, use a reasoning model to prioritize and filter findings.",
+    )
+    parser.add_argument(
+        "--llm-triage-model",
+        type=str,
+        default=None,
+        help="Model for --llm-triage (default: gpt-5.5).",
+    )
+    parser.add_argument(
+        "--llm-triage-reasoning-effort",
+        type=str,
+        default="high",
+        help="Reasoning effort for --llm-triage (default: high).",
+    )
+    parser.add_argument(
+        "--llm-triage-batch-size",
+        type=int,
+        default=10,
+        help="Findings per --llm-triage batch after similarity sorting (default: 10).",
+    )
+    parser.add_argument(
+        "--llm-triage-output-file",
+        type=str,
+        help="Write --llm-triage p0-p4 JSON to this path.",
+    )
+    parser.add_argument(
         "--ignore-index",
         action="store_true",
         help="Allow selected analysis commands to run without an index-backed context.",
