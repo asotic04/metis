@@ -4,9 +4,17 @@
 
 import importlib
 import inspect
+import json
+import logging
+from datetime import datetime
 from pathlib import Path
 from rich.markup import escape
 
+from metis.engine.llm_triage_service import (
+    DEFAULT_LLM_TRIAGE_BATCH_SIZE,
+    DEFAULT_LLM_TRIAGE_MODEL,
+    DEFAULT_LLM_TRIAGE_REASONING_EFFORT,
+)
 from metis.engine.options import ReviewOptions, TriageOptions
 from .command_runtime import CommandRuntime
 from .review_progress import ReviewCodeProgressReporter
@@ -52,8 +60,7 @@ def _triage_options_for_runtime(args, runtime: CommandRuntime) -> TriageOptions:
 
 
 def show_help(args=None):
-    print_console(
-        """
+    print_console("""
 [bold blue]Metis CLI[/bold blue]
 
 Type one of the following commands (with arguments):
@@ -74,13 +81,17 @@ Options:
     --custom-prompt PATH       Custom prompt file (.md or .txt) to guide analysis.
     --triage                   Triage findings and annotate SARIF output for review commands.
     --include-triaged          Include findings already triaged by Metis.
+    --llm-triage               Run reasoning-model triage after review_file or review_code.
+    --llm-triage-model MODEL   Model for --llm-triage (default: gpt-5.5).
+    --llm-triage-reasoning-effort LEVEL  Reasoning effort for --llm-triage (default: high).
+    --llm-triage-batch-size N  Findings per LLM triage batch after similarity sorting (default: 10).
+    --llm-triage-output-file PATH  Save the p0-p4 LLM triage JSON to this path.
     --ignore-index             Allow review_file, review_code, review_patch, and triage to run without index-backed context.
     --project-schema SCHEMA    (Optional) Project identifier if postgresql is used.
     --chroma-dir DIR           (Optional) Directory to store ChromaDB data (default: ./chromadb).
     --verbose                  (Optional) Shows detailed output in the terminal window.
     --version                  (Optional) Show program version
-"""
-    )
+""")
 
 
 def show_version(args=None):
@@ -315,7 +326,120 @@ def _build_triaged_sarif_payload(engine, results, args, runtime: CommandRuntime)
         return None
 
 
+def _llm_triage_requested(args) -> bool:
+    return bool(getattr(args, "llm_triage", False))
+
+
+def _llm_triage_supported(runtime: CommandRuntime) -> bool:
+    return runtime.command in {"review_code", "review_file"}
+
+
+def _llm_triage_batch_size(args) -> int:
+    try:
+        batch_size = int(
+            getattr(args, "llm_triage_batch_size", DEFAULT_LLM_TRIAGE_BATCH_SIZE)
+            or DEFAULT_LLM_TRIAGE_BATCH_SIZE
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_LLM_TRIAGE_BATCH_SIZE
+    return max(1, batch_size)
+
+
+def _resolve_llm_triage_output_path(args, runtime: CommandRuntime) -> Path:
+    requested = getattr(args, "llm_triage_output_file", None)
+    if requested:
+        return Path(str(requested))
+
+    output_files = getattr(args, "output_file", None) or []
+    if isinstance(output_files, (str, Path)):
+        output_files = [output_files]
+    if output_files:
+        base = Path(str(output_files[0]))
+        return base.with_name(f"{base.stem}_llm_triage.json")
+
+    Path("results").mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path("results") / f"{runtime.command}_llm_triage_{timestamp}.json"
+
+
+def _write_llm_triage_output(payload: dict, output_path: Path, quiet: bool) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=4)
+    print_console(
+        f"[blue]LLM triage saved to {escape(str(output_path))}[/blue]",
+        quiet,
+    )
+
+
+def _run_llm_triage_if_requested(engine, results, args, runtime: CommandRuntime):
+    if not _llm_triage_requested(args):
+        return None
+    if not _llm_triage_supported(runtime):
+        print_console(
+            "[yellow]LLM triage skipped:[/yellow] --llm-triage only applies to review_code and review_file.",
+            args.quiet,
+        )
+        return None
+
+    model = getattr(args, "llm_triage_model", None) or DEFAULT_LLM_TRIAGE_MODEL
+    reasoning_effort = (
+        getattr(args, "llm_triage_reasoning_effort", None)
+        or DEFAULT_LLM_TRIAGE_REASONING_EFFORT
+    )
+    batch_size = _llm_triage_batch_size(args)
+
+    def _progress(event):
+        if not getattr(args, "verbose", False):
+            return
+        ev = str(event.get("event") or "")
+        if ev == "llm_triage_start":
+            print_console(
+                f"[cyan]LLM triage: {event.get('findings', 0)} finding(s) in "
+                f"{event.get('batches', 0)} batch(es)[/cyan]",
+                args.quiet,
+            )
+        elif ev == "llm_triage_batch_done":
+            print_console(
+                f"[green]LLM triage batch {event.get('batch', 0)}/"
+                f"{event.get('batches', 0)}: kept {event.get('kept', 0)}[/green]",
+                args.quiet,
+            )
+        elif ev == "llm_triage_done":
+            print_console(
+                f"[green]LLM triage: kept {event.get('kept', 0)}, "
+                f"filtered {event.get('filtered', 0)}[/green]",
+                args.quiet,
+            )
+
+    try:
+        with usage_operation("llm_triage"):
+            payload = with_spinner(
+                "LLM triaging findings...",
+                engine.llm_triage_reviews,
+                results,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                batch_size=batch_size,
+                progress_callback=_progress,
+                quiet=args.quiet,
+            )
+        _write_llm_triage_output(
+            payload,
+            _resolve_llm_triage_output_path(args, runtime),
+            args.quiet,
+        )
+        return payload
+    except Exception as exc:
+        print_console(
+            f"[yellow]LLM triage skipped due to error: {escape(str(exc))}[/yellow]",
+            args.quiet,
+        )
+        return None
+
+
 def _finalize_review_output(engine, results, args, runtime: CommandRuntime):
     pretty_print_reviews(results, args.quiet)
     sarif_payload = _build_triaged_sarif_payload(engine, results, args, runtime)
+    _run_llm_triage_if_requested(engine, results, args, runtime)
     save_output(args.output_file, results, args.quiet, sarif_payload=sarif_payload)

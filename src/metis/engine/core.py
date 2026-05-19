@@ -14,6 +14,7 @@ from metis.vector_store.base import BaseVectorStore
 
 from .graphs import AskGraph, ReviewGraph
 from .indexing_service import IndexingService
+from .llm_triage_service import LlmTriageService
 from .options import TriageOptions, coerce_triage_options
 from .reachability.service import TreeSitterReachabilityService
 from .repository import EngineRepository
@@ -142,6 +143,11 @@ class MetisEngine:
             review_graph_factory=lambda: self._get_review_graph(),
             reachability_service=self.reachability,
             reachability_settings=self.reachability_settings,
+        )
+        self.llm_triage = LlmTriageService(
+            codebase_path=self.codebase_path,
+            llm_provider=self.llm_provider,
+            usage_runtime=self.usage_runtime,
         )
         self._triage_service = self._build_triage_service()
 
@@ -337,6 +343,9 @@ class MetisEngine:
             checkpoint_callback=checkpoint_callback,
             options=options,
         )
+
+    def llm_triage_reviews(self, results: dict, **kwargs) -> dict:
+        return self.llm_triage.triage_review_results(results, **kwargs)
 
     def triage_sarif_file(
         self,

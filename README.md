@@ -200,6 +200,7 @@ Metis provides an interactive CLI with several built-in commands. After launchin
 - `--project-schema` / `--chroma-dir` – backend-specific knobs.
 - `--triage` – after `review_code`, `review_file`, or `review_patch`, triage findings and annotate SARIF output.
 - `--include-triaged` – include findings already triaged by Metis when running triage.
+- `--llm-triage` – after `review_code` or `review_file`, group similar findings, add bounded repo-search evidence for callers/references/related identifiers, run a reasoning-model triage pass, and write a separate JSON containing p0-p4 findings sorted by priority. The pass can also add newly noticed findings when the provided code/search evidence directly supports them. Use `--llm-triage-model`, `--llm-triage-reasoning-effort`, `--llm-triage-batch-size`, and `--llm-triage-output-file` to tune it.
 - `--ignore-index` – allow `review_code`, `review_file`, `review_patch`, and `triage` to run without index-backed context. Metis warns and skips retrieval in this mode. It does not apply to `ask` or `update`.
 - `--verbose`, `--quiet`, `--output-file`, `--output-files` – control logging and export formats.
 
@@ -331,7 +332,19 @@ metis --non-interactive \
 metis --non-interactive --command "triage results/review.sarif"
 ```
 
-#### Example 7: Review without index-backed retrieval
+#### Example 7: Review and priority-triage JSON findings
+
+```bash
+metis --non-interactive \
+  --llm-triage \
+  --llm-triage-model gpt-5.5 \
+  --llm-triage-reasoning-effort high \
+  --command "review_code" \
+  --output-file results/full_review.json \
+  --llm-triage-output-file results/full_review_llm_triage.json
+```
+
+#### Example 8: Review without index-backed retrieval
 
 ```bash
 metis --non-interactive \
@@ -340,7 +353,7 @@ metis --non-interactive \
   --output-file results/full_review.json
 ```
 
-#### Example 8: Triage an existing SARIF file into a new output file
+#### Example 9: Triage an existing SARIF file into a new output file
 
 ```bash
 metis --non-interactive \

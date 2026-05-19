@@ -80,6 +80,37 @@ def test_execute_command_rejects_triage_flag_for_ask_before_index_gating(monkeyp
     assert not any("Index missing" in message for message in captured)
 
 
+def test_execute_command_rejects_llm_triage_flag_for_ask_before_index_gating(
+    monkeypatch,
+):
+    args = SimpleNamespace(
+        quiet=True,
+        triage=False,
+        llm_triage=True,
+        output_file=None,
+        ignore_index=True,
+        non_interactive=True,
+        codebase_path="src/metis",
+    )
+    captured = []
+    monkeypatch.setattr(
+        command_registry,
+        "print_console",
+        lambda message, *_args, **_kwargs: captured.append(str(message)),
+    )
+
+    result = entry.execute_command(
+        SimpleNamespace(),
+        "ask",
+        ["hi"],
+        args,
+    )
+
+    assert result is None
+    assert any("--llm-triage can only be used" in message for message in captured)
+    assert not any("Index missing" in message for message in captured)
+
+
 def test_execute_command_allows_interactive_triage_command_with_global_triage_flag(
     monkeypatch,
 ):

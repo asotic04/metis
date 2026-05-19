@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 from metis.cli import commands
@@ -243,3 +244,59 @@ def test_run_review_code_triggers_triage_when_global_flag_enabled(monkeypatch):
     commands.run_review_code(engine, args, runtime)
 
     assert calls == [False]
+
+
+def test_finalize_review_output_runs_llm_triage_and_writes_json(monkeypatch, tmp_path):
+    triage_path = tmp_path / "triaged.json"
+    calls = []
+
+    class _Engine:
+        def llm_triage_reviews(self, results, **kwargs):
+            calls.append((results, kwargs))
+            return {
+                "summary": {
+                    "total_input_findings": 1,
+                    "kept_findings": 1,
+                    "filtered_findings": 0,
+                },
+                "issues": [{"id": "F001", "priority": "p1"}],
+            }
+
+    args = SimpleNamespace(
+        verbose=False,
+        quiet=True,
+        triage=False,
+        output_file=[str(tmp_path / "review.json")],
+        llm_triage=True,
+        llm_triage_model="gpt-test",
+        llm_triage_reasoning_effort="high",
+        llm_triage_batch_size=10,
+        llm_triage_output_file=str(triage_path),
+    )
+    runtime = CommandRuntime(
+        command="review_file",
+        command_args=["a.c"],
+        use_retrieval_context=True,
+    )
+    results = {"reviews": [{"file": "a.c", "reviews": [{"issue": "bug"}]}]}
+
+    monkeypatch.setattr(commands, "pretty_print_reviews", lambda *_args: None)
+    monkeypatch.setattr(commands, "save_output", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        commands,
+        "with_spinner",
+        lambda _message, func, *func_args, **func_kwargs: func(
+            *func_args,
+            **{k: v for k, v in func_kwargs.items() if k != "quiet"},
+        ),
+    )
+
+    commands._finalize_review_output(_Engine(), results, args, runtime)
+
+    assert calls[0][0] == results
+    assert calls[0][1]["model"] == "gpt-test"
+    assert calls[0][1]["reasoning_effort"] == "high"
+    assert calls[0][1]["batch_size"] == 10
+    assert json.loads(triage_path.read_text(encoding="utf-8"))["issues"] == [
+        {"id": "F001", "priority": "p1"}
+    ]
