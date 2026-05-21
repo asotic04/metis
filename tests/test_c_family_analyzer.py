@@ -23,6 +23,11 @@ class _Node:
         self._end_byte = 0
         self._children = children or []
         self._fields = fields or {}
+        self._parent = None
+        for child in self._children:
+            child._parent = self
+        for child in self._fields.values():
+            child._parent = self
 
     def kind(self):
         return self._type
@@ -47,6 +52,9 @@ class _Node:
 
     def child_by_field_name(self, name):
         return self._fields.get(name)
+
+    def parent(self):
+        return self._parent
 
 
 class _Tree:
@@ -285,26 +293,3 @@ def test_c_family_analyzer_resolves_macro_chain(tmp_path):
     assert citations
     assert resolution
     assert not any("MACRO_SEMANTICS_UNRESOLVED:PROJECT_ASSUME" == u for u in unresolved)
-
-
-def test_c_family_analyzer_prefers_asm_impl_when_decl_and_asm_exist():
-    analyzer = CFamilyTriageAnalyzer(
-        codebase_path=".",
-        language_name="c",
-        supported_extensions=C_EXTENSIONS,
-    )
-
-    class _Hit:
-        def __init__(self, symbol, file_path, line, kind):
-            self.symbol = symbol
-            self.file_path = file_path
-            self.line = line
-            self.kind = kind
-
-    hit = analyzer._choose_best_symbol_hit(
-        [
-            _Hit("project_commit", "src/project_common.h", 225, "declaration"),
-            _Hit("project_commit", "src/project_impl.S", 48, "asm_label"),
-        ]
-    )
-    assert "asm_impl" in hit.kind

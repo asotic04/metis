@@ -17,8 +17,8 @@ from metis.engine.analysis.c_family_analyzer_common import (
 from metis.engine.analysis.c_family_macro import (
     collect_c_macro_definition_sections,
     collect_c_macro_like_calls_from_scope,
-    is_c_family_file_path,
 )
+from metis.plugins.c_family import is_c_family_plugin
 
 from . import constants as C
 from .debug import _emit_debug
@@ -31,6 +31,19 @@ from .evidence_text import (
     _parse_grep_hits,
     _token_pattern,
 )
+
+
+def _has_c_family_triage_analyzer(state: TriageState, file_path: str) -> bool:
+    if not is_c_family_plugin(state.get("triage_plugin")):
+        return False
+    analyzer = state.get("triage_analyzer")
+    supports_file = getattr(analyzer, "supports_file", None)
+    if not callable(supports_file):
+        return True
+    try:
+        return bool(supports_file(file_path))
+    except Exception:
+        return False
 
 
 def _safe_tool_capture(
@@ -227,7 +240,7 @@ def _collect_treesitter_scope_symbols(
         if len(merged) >= max_symbols:
             break
     macros: list[str] = []
-    if is_c_family_file_path(file_path):
+    if _has_c_family_triage_analyzer(state, file_path):
         macros = collect_c_macro_like_calls_from_scope(
             scope,
             source,
@@ -352,7 +365,7 @@ def _collect_macro_definition_sections(
     macro_names: list[str],
     max_sections: int,
 ) -> tuple[list[str], dict[str, str]]:
-    if not is_c_family_file_path(file_path) or not macro_names:
+    if not _has_c_family_triage_analyzer(state, file_path) or not macro_names:
         return [], {}
 
     def _dispatch_invoke(invoke):
