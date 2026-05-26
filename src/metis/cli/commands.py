@@ -3,6 +3,7 @@
 
 
 import importlib
+import copy
 import json
 import logging
 from datetime import datetime
@@ -382,8 +383,77 @@ def _run_llm_triage_if_requested(engine, results, args, runtime: CommandRuntime)
         return None
 
 
+def _review_results_from_llm_triage_payload(results: dict, payload: dict | None) -> dict:
+    if not isinstance(payload, dict):
+        return results
+    issues = payload.get("issues")
+    if not isinstance(issues, list):
+        return results
+
+    grouped: dict[str, dict] = {}
+    original_reviews = results.get("reviews") if isinstance(results, dict) else None
+    if isinstance(original_reviews, list):
+        for file_entry in original_reviews:
+            if not isinstance(file_entry, dict):
+                continue
+            file_name = str(file_entry.get("file") or file_entry.get("file_path") or "")
+            file_path = str(file_entry.get("file_path") or "")
+            key = file_name or file_path
+            if not key:
+                continue
+            grouped.setdefault(
+                key,
+                {
+                    "file": file_name,
+                    "file_path": file_path,
+                    "reviews": [],
+                },
+            )
+
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        issue_copy = copy.deepcopy(issue)
+        file_name = str(
+            issue_copy.get("file")
+            or issue_copy.get("primary_file")
+            or issue_copy.get("file_path")
+            or "UNKNOWN FILE"
+        )
+        file_path = str(issue_copy.get("file_path") or "")
+        key = file_name or file_path
+        entry = grouped.setdefault(
+            key,
+            {
+                "file": file_name,
+                "file_path": file_path,
+                "reviews": [],
+            },
+        )
+        if not entry.get("file") and file_name:
+            entry["file"] = file_name
+        if not entry.get("file_path") and file_path:
+            entry["file_path"] = file_path
+        entry["reviews"].append(issue_copy)
+
+    final_results = copy.deepcopy(results) if isinstance(results, dict) else {}
+    final_results["reviews"] = [
+        entry for entry in grouped.values() if entry.get("reviews")
+    ]
+    final_results["llm_triage_summary"] = copy.deepcopy(payload.get("summary") or {})
+    return final_results
+
+
 def _finalize_review_output(engine, results, args, runtime: CommandRuntime):
-    pretty_print_reviews(results, args.quiet)
-    sarif_payload = _build_triaged_sarif_payload(engine, results, args, runtime)
-    _run_llm_triage_if_requested(engine, results, args, runtime)
-    save_output(args.output_file, results, args.quiet, sarif_payload=sarif_payload)
+    llm_triage_payload = _run_llm_triage_if_requested(engine, results, args, runtime)
+    final_results = _review_results_from_llm_triage_payload(
+        results, llm_triage_payload
+    )
+    pretty_print_reviews(final_results, args.quiet)
+    sarif_payload = _build_triaged_sarif_payload(engine, final_results, args, runtime)
+    save_output(
+        args.output_file,
+        final_results,
+        args.quiet,
+        sarif_payload=sarif_payload,
+    )

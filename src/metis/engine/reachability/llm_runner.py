@@ -8,8 +8,16 @@ from __future__ import annotations
 from langchain_core.prompts import ChatPromptTemplate
 
 
-def _chat_model_kwargs(usage_runtime, *, reasoning_effort=None):
-    kwargs = usage_runtime.hooks.chat_model_kwargs()
+def _chat_model_kwargs(
+    usage_runtime, *, reasoning_effort=None, structured_output=False
+):
+    hooks = getattr(usage_runtime, "hooks", None)
+    kwargs = hooks.chat_model_kwargs() if hooks is not None else {}
+    if structured_output:
+        # Chat Completions rejects reasoning_effort when structured output uses
+        # function tools; keep these calls compatible with that API path.
+        kwargs.pop("reasoning_effort", None)
+        return kwargs
     if reasoning_effort and str(reasoning_effort).lower() not in {
         "none",
         "off",
@@ -33,7 +41,11 @@ def invoke_reachability_prompt(
     reasoning_effort=None,
     temperature=0.1,
 ):
-    kwargs = _chat_model_kwargs(usage_runtime, reasoning_effort=reasoning_effort)
+    kwargs = _chat_model_kwargs(
+        usage_runtime,
+        reasoning_effort=reasoning_effort,
+        structured_output=response_model is not None,
+    )
     chat = llm_provider.get_chat_model(
         model=model,
         max_tokens=max_tokens,

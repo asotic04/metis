@@ -41,6 +41,22 @@ def test_review_code_uses_reachability_for_c_cpp(engine):
     engine.review.review_file.assert_not_called()
 
 
+def test_review_code_falls_back_when_reachability_returns_no_results(engine):
+    reachability = Mock()
+    reachability.review_codebase.return_value = []
+    engine.review._reachability_service = reachability
+    engine.review._reachability_cache = None
+    engine.review._review_file_standard = Mock(
+        return_value={"file": "test.c", "reviews": ["legacy"]}
+    )
+
+    results = list(engine.review.review_code(get_code_files_func=lambda: ["test.c"]))
+
+    assert results == [{"file": "test.c", "reviews": ["legacy"]}]
+    reachability.review_codebase.assert_called_once()
+    engine.review._review_file_standard.assert_called_once()
+
+
 def test_review_code_uses_legacy_for_non_c_cpp(engine):
     reachability = Mock()
     reachability.review_codebase.return_value = [

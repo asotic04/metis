@@ -300,3 +300,109 @@ def test_finalize_review_output_runs_llm_triage_and_writes_json(monkeypatch, tmp
     assert json.loads(triage_path.read_text(encoding="utf-8"))["issues"] == [
         {"id": "F001", "priority": "p1"}
     ]
+
+
+def test_finalize_review_output_saves_llm_triaged_review_report(
+    monkeypatch, tmp_path
+):
+    triage_path = tmp_path / "triaged.json"
+    review_path = tmp_path / "review.json"
+    captured = {}
+
+    class _Engine:
+        def llm_triage_reviews(self, results, **kwargs):
+            return {
+                "summary": {
+                    "total_input_findings": 2,
+                    "kept_findings": 1,
+                    "kept_input_findings": 1,
+                    "filtered_findings": 1,
+                    "additional_findings": 0,
+                    "errors": [],
+                },
+                "issues": [
+                    {
+                        "id": "F001",
+                        "priority": "p1",
+                        "file": "a.c",
+                        "file_path": "/repo/a.c",
+                        "line_number": 7,
+                        "issue": "Kept issue",
+                        "severity": "High",
+                    }
+                ],
+            }
+
+    args = SimpleNamespace(
+        verbose=False,
+        quiet=True,
+        triage=False,
+        output_file=[str(review_path)],
+        llm_triage=True,
+        llm_triage_model="gpt-test",
+        llm_triage_reasoning_effort="high",
+        llm_triage_batch_size=10,
+        llm_triage_output_file=str(triage_path),
+    )
+    runtime = CommandRuntime(
+        command="review_file",
+        command_args=["a.c"],
+        use_retrieval_context=True,
+    )
+    results = {
+        "reviews": [
+            {
+                "file": "a.c",
+                "file_path": "/repo/a.c",
+                "reviews": [
+                    {"issue": "Kept issue", "line_number": 7},
+                    {"issue": "Filtered issue", "line_number": 9},
+                ],
+            }
+        ]
+    }
+
+    monkeypatch.setattr(
+        commands,
+        "pretty_print_reviews",
+        lambda data, *_args: captured.setdefault("printed", data),
+    )
+    monkeypatch.setattr(
+        commands,
+        "save_output",
+        lambda _files, data, *_args, **_kwargs: captured.setdefault("saved", data),
+    )
+    monkeypatch.setattr(
+        commands,
+        "with_spinner",
+        lambda _message, func, *func_args, **func_kwargs: func(
+            *func_args,
+            **{k: v for k, v in func_kwargs.items() if k != "quiet"},
+        ),
+    )
+
+    commands._finalize_review_output(_Engine(), results, args, runtime)
+
+    saved = captured["saved"]
+    assert saved == captured["printed"]
+    assert saved["llm_triage_summary"]["filtered_findings"] == 1
+    assert saved["reviews"] == [
+        {
+            "file": "a.c",
+            "file_path": "/repo/a.c",
+            "reviews": [
+                {
+                    "id": "F001",
+                    "priority": "p1",
+                    "file": "a.c",
+                    "file_path": "/repo/a.c",
+                    "line_number": 7,
+                    "issue": "Kept issue",
+                    "severity": "High",
+                }
+            ],
+        }
+    ]
+    assert json.loads(triage_path.read_text(encoding="utf-8"))["summary"][
+        "filtered_findings"
+    ] == 1

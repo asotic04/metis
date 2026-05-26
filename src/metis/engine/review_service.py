@@ -223,10 +223,11 @@ class ReviewService:
         if not files:
             return
 
+        c_family_files = [path for path in files if self._is_c_family_file(path)]
         run_codebase_reachability = (
             self._reachability_service is not None
             and review_file_func is None
-            and any(self._is_c_family_file(path) for path in files)
+            and bool(c_family_files)
         )
         reachability_failed = False
         if run_codebase_reachability:
@@ -241,11 +242,21 @@ class ReviewService:
                 )
                 reachability_failed = True
             else:
+                results = list(results)
                 for result in results:
                     yield result
-                files = [path for path in files if not self._is_c_family_file(path)]
-                if not files:
-                    return
+                if results:
+                    files = [
+                        path for path in files if not self._is_c_family_file(path)
+                    ]
+                    if not files:
+                        return
+                else:
+                    logger.debug(
+                        "Tree-sitter codebase review returned no findings; "
+                        "falling back to standard C-family review"
+                    )
+                    reachability_failed = True
 
         review_fn = (
             self._review_file_standard

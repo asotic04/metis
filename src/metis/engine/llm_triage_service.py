@@ -10,9 +10,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from metis.utils import parse_json_output
 
-from .reachability.llm_runner import invoke_reachability_prompt
 from .reachability.source_context import _read_line_context, _read_named_function_body
 
 DEFAULT_LLM_TRIAGE_MODEL = "gpt-5.5"
@@ -79,19 +80,40 @@ _TRIAGE_SYSTEM_PROMPT = """\
 You are a senior security triage reviewer for C/C++ and systems code.
 
 Triage the supplied security review findings as exploitable vulnerability candidates.
-Use the code context, path context, evidence, severity, and reasoning. Be strict.
+You are not the original reporter. Your job is to reduce noise and keep only the
+strongest independent security bugs. Use the code context, path context, evidence,
+severity, and reasoning. Be strict.
 
-Priority scale:
-- p0: clean, high-confidence exploitable bug with direct evidence and minimal assumptions.
-- p1: likely exploitable, strong evidence, only normal environmental assumptions.
-- p2: real security bug, but exploitation needs some conditions or more context.
-- p3: plausible real bug with meaningful prerequisites or limited impact.
-- p4: probably real but weak, contextual, low impact, or needs several prerequisites.
-- p5: false positive, duplicate, wrong code interpretation, non-exploitable code-quality issue,
-      missing prerequisite, or not a security vulnerability.
+Default priority scale:
+- p0: address immediately with as many resources as required. The issue causes a full
+      outage or makes a critical product function unavailable for everyone, and there
+      is no known workaround.
+- p1: address quickly. The issue significantly affects a large percentage of users;
+      any workaround is only partial or overly painful. The issue impacts a core
+      organizational function or fundamentally impedes another team.
+- p2: address on a reasonable timescale. This is the default for kept real security
+      issues. Use p2 for issues that would be p0/p1 but have a reasonable workaround,
+      issues important to many users and connected to core organizational functions,
+      issues that impede other teams with no reasonable workaround, and first-use or
+      install-time issues.
+- p3: address when able. The issue is relevant to core organizational functions or
+      other teams, but does not impede progress, or has a reasonable workaround.
+- p4: address eventually. The issue is not relevant to core organizational functions
+      or other teams, or relates only to system attractiveness or pleasantness.
+- p5: Metis-only filtered state, not an issue-tracker priority. Use p5 for false
+      positives, duplicates, wrong code interpretation, non-exploitable code-quality
+      issues, missing prerequisites, or findings that are not security vulnerabilities.
 
-Prefer filtering over keeping noisy findings. Mark duplicates as p5 and set duplicate_of to the
-canonical finding id in the same batch when possible. Return JSON only.
+Assign p0-p4 by expected product/user/team impact and urgency, not only by CWE class
+or exploitability. Default to p2 for a kept real security issue unless the evidence
+supports higher urgency or lower organizational impact.
+
+Classify reliability-only crashes, generic missing validation in internal helpers, unchecked
+allocation failures, development-only configuration issues, and theoretical resource exhaustion
+as p5 unless the batch evidence shows a realistic attacker-controlled path and security impact.
+Do not keep multiple findings for the same root cause; keep the clearest representative and mark
+the rest p5 with duplicate_of. Do not keep every finding in a batch unless all are independent,
+directly evidenced vulnerabilities. Return JSON only.
 """
 
 _TRIAGE_USER_PROMPT = """\
@@ -213,13 +235,11 @@ class LlmTriageService:
                     }
                 )
             try:
-                raw = invoke_reachability_prompt(
+                raw = _invoke_triage_prompt(
                     self._llm_provider,
                     self._usage_runtime,
                     model=model,
                     max_tokens=max_tokens,
-                    system_prompt=_TRIAGE_SYSTEM_PROMPT,
-                    user_prompt=_TRIAGE_USER_PROMPT,
                     variables={
                         "batch_json": json.dumps(_batch_payload(batch), indent=2)
                     },
@@ -279,12 +299,14 @@ class LlmTriageService:
             errors=errors,
         )
         if progress_callback:
+            summary = payload["summary"]
             progress_callback(
                 {
                     "event": "llm_triage_done",
-                    "findings": len(findings),
-                    "kept": len(payload["issues"]),
-                    "filtered": len(findings) - len(payload["issues"]),
+                    "findings": summary["total_input_findings"],
+                    "kept": summary["kept_findings"],
+                    "filtered": summary["filtered_findings"],
+                    "additional": summary["additional_findings"],
                 }
             )
         return payload
@@ -456,7 +478,14 @@ class LlmTriageService:
             seen_duplicate_keys.add(duplicate_key)
             kept.append(issue)
 
+        kept, collapsed_duplicates = _consolidate_triaged_issues(kept)
+        dropped += collapsed_duplicates
         kept.sort(key=_triaged_issue_sort_key)
+        kept_input_findings = sum(
+            1 for issue in kept if not _is_additional_issue(issue)
+        )
+        kept_additional_findings = sum(1 for issue in kept if _is_additional_issue(issue))
+        filtered_findings = max(0, len(findings) - kept_input_findings)
         return {
             "summary": {
                 "schema_version": 1,
@@ -465,8 +494,9 @@ class LlmTriageService:
                 "batch_size": batch_size,
                 "total_input_findings": len(findings),
                 "kept_findings": len(kept),
-                "filtered_findings": dropped,
-                "additional_findings": next_additional_id - 1,
+                "kept_input_findings": kept_input_findings,
+                "filtered_findings": filtered_findings,
+                "additional_findings": kept_additional_findings,
                 "errors": errors,
             },
             "issues": kept,
@@ -498,10 +528,53 @@ def _batch_payload(batch: list[_FindingRecord]) -> list[dict[str, Any]]:
     return payload
 
 
+def _invoke_triage_prompt(
+    llm_provider,
+    usage_runtime,
+    *,
+    model: str,
+    max_tokens: int,
+    variables: dict[str, Any],
+    reasoning_effort: str | None = None,
+    temperature: float = 0.0,
+) -> str:
+    kwargs = _triage_chat_model_kwargs(
+        usage_runtime, reasoning_effort=reasoning_effort
+    )
+    chat = llm_provider.get_chat_model(
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        **kwargs,
+    )
+    prompt = ChatPromptTemplate.from_messages(
+        [("system", _TRIAGE_SYSTEM_PROMPT), ("user", _TRIAGE_USER_PROMPT)]
+    )
+    return (prompt | chat | StrOutputParser()).invoke(variables).strip()
+
+
+def _triage_chat_model_kwargs(usage_runtime, *, reasoning_effort=None) -> dict[str, Any]:
+    hooks = getattr(usage_runtime, "hooks", None)
+    kwargs = hooks.chat_model_kwargs() if hooks is not None else {}
+    if reasoning_effort and str(reasoning_effort).lower() not in {
+        "none",
+        "off",
+        "false",
+        "default",
+    }:
+        kwargs["reasoning_effort"] = reasoning_effort
+    return kwargs
+
+
 def _parse_triage_response(
-    raw: str, batch: list[_FindingRecord]
+    raw: Any, batch: list[_FindingRecord]
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-    parsed = parse_json_output(raw)
+    if hasattr(raw, "model_dump"):
+        parsed = raw.model_dump()
+    elif isinstance(raw, dict):
+        parsed = raw
+    else:
+        parsed = parse_json_output(raw)
     if not isinstance(parsed, dict):
         return {}, []
     decisions = parsed.get("decisions")
@@ -808,6 +881,278 @@ def _dedupe_key_for_values(
         _safe_positive_int(line_number, 0),
         issue_text,
     )
+
+
+def _consolidate_triaged_issues(
+    issues: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    selected: list[dict[str, Any]] = []
+    removed_input_findings = 0
+    for issue in sorted(issues, key=_triaged_issue_sort_key):
+        duplicate_of = _find_duplicate_issue(issue, selected)
+        if duplicate_of is None:
+            selected.append(issue)
+            continue
+        if not str(issue.get("id") or "").startswith("A"):
+            removed_input_findings += 1
+    return selected, removed_input_findings
+
+
+def _find_duplicate_issue(
+    issue: dict[str, Any], selected: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    for existing in selected:
+        if _issues_are_near_duplicates(issue, existing):
+            return existing
+    return None
+
+
+def _issues_are_near_duplicates(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    file_a = _issue_file(a)
+    file_b = _issue_file(b)
+    if not file_a or not file_b:
+        return False
+
+    family_a = _issue_family(a)
+    family_b = _issue_family(b)
+    same_family = bool(family_a and family_a == family_b)
+    if file_a != file_b:
+        return _issues_are_cross_file_duplicates(a, b, family_a, family_b)
+
+    canonical_a = _canonical_key(a)
+    canonical_b = _canonical_key(b)
+    if canonical_a and canonical_a == canonical_b:
+        return True
+
+    line_a = _safe_positive_int(a.get("line_number"), 0)
+    line_b = _safe_positive_int(b.get("line_number"), 0)
+    function_a = _issue_function(a)
+    function_b = _issue_function(b)
+    same_function = bool(function_a and function_a == function_b)
+    line_distance = abs(line_a - line_b) if line_a and line_b else 9999
+
+    # Same primary statement: keep the strongest representative. This catches
+    # common model/report variants such as null-deref plus overflow on one call.
+    if line_a and line_a == line_b and (same_function or not function_a or not function_b):
+        return True
+
+    similarity = _issue_similarity(a, b)
+
+    if same_function and line_distance <= 2 and similarity >= 0.30:
+        return True
+    if same_function and line_distance <= 5 and same_family and similarity >= 0.24:
+        return True
+    if same_family and similarity >= 0.50:
+        return True
+
+    canonical_similarity = _canonical_similarity(canonical_a, canonical_b)
+    return bool(same_family and canonical_similarity >= 0.40)
+
+
+_CROSS_FILE_DUPLICATE_FAMILIES = frozenset(
+    {
+        "authorization",
+        "command_injection",
+        "format_string",
+        "path_traversal",
+        "sql_injection",
+        "unsafe_deserialization",
+    }
+)
+
+
+def _issues_are_cross_file_duplicates(
+    a: dict[str, Any],
+    b: dict[str, Any],
+    family_a: str,
+    family_b: str,
+) -> bool:
+    if not family_a or family_a != family_b:
+        return False
+    if family_a not in _CROSS_FILE_DUPLICATE_FAMILIES:
+        return False
+
+    tokens_a = _duplicate_tokens(a)
+    tokens_b = _duplicate_tokens(b)
+    shared = tokens_a & tokens_b
+    if family_a == "format_string" and {"util_log", "vprintf"} & shared:
+        return True
+    return _jaccard(tokens_a, tokens_b) >= 0.50
+
+
+def _issue_file(issue: dict[str, Any]) -> str:
+    return (
+        str(issue.get("file") or issue.get("primary_file") or "")
+        .replace("\\", "/")
+        .lstrip("./")
+    )
+
+
+def _issue_function(issue: dict[str, Any]) -> str:
+    return _function_name(issue.get("primary_function") or issue.get("sink_function"))
+
+
+_CANONICAL_KEY_RE = re.compile(r"Canonical key:\s*([^\n\r]+)")
+
+
+def _canonical_key(issue: dict[str, Any]) -> str:
+    explicit = str(issue.get("canonical_key") or "").strip()
+    if explicit:
+        return explicit.lower()
+    reasoning = str(issue.get("reasoning") or "")
+    match = _CANONICAL_KEY_RE.search(reasoning)
+    return match.group(1).strip().lower() if match else ""
+
+
+def _issue_family(issue: dict[str, Any]) -> str:
+    canonical = _canonical_key(issue)
+    if canonical:
+        parts = canonical.split(":")
+        if len(parts) >= 3 and parts[2]:
+            return _normalise_family(parts[2])
+
+    cwe = str(issue.get("cwe") or "").upper()
+    cwe_family = {
+        "CWE-22": "path_traversal",
+        "CWE-78": "command_injection",
+        "CWE-89": "sql_injection",
+        "CWE-120": "memory_bounds",
+        "CWE-125": "memory_bounds",
+        "CWE-134": "format_string",
+        "CWE-190": "integer_overflow",
+        "CWE-191": "integer_overflow",
+        "CWE-200": "information_disclosure",
+        "CWE-252": "unchecked_error",
+        "CWE-256": "credential_storage",
+        "CWE-285": "authorization",
+        "CWE-287": "authentication",
+        "CWE-404": "lifetime",
+        "CWE-415": "lifetime",
+        "CWE-416": "lifetime",
+        "CWE-476": "null_deref",
+        "CWE-502": "unsafe_deserialization",
+        "CWE-639": "authorization",
+        "CWE-664": "lifetime",
+        "CWE-696": "state_order",
+        "CWE-787": "memory_bounds",
+        "CWE-798": "hardcoded_secret",
+        "CWE-862": "authorization",
+        "CWE-863": "authorization",
+        "CWE-911": "lifetime",
+        "CWE-1188": "unsafe_deployment",
+    }.get(cwe)
+    if cwe_family:
+        return cwe_family
+
+    text = _issue_text(issue).lower()
+    keyword_families = (
+        ("sql", "sql_injection"),
+        ("command injection", "command_injection"),
+        ("path traversal", "path_traversal"),
+        ("pickle", "unsafe_deserialization"),
+        ("deserialize", "unsafe_deserialization"),
+        ("format string", "format_string"),
+        ("double free", "lifetime"),
+        ("use-after-free", "lifetime"),
+        ("use after free", "lifetime"),
+        ("refcount", "lifetime"),
+        ("out-of-bounds", "memory_bounds"),
+        ("out of bounds", "memory_bounds"),
+        ("buffer", "memory_bounds"),
+        ("integer overflow", "integer_overflow"),
+        ("auth", "authorization"),
+        ("permission", "authorization"),
+        ("hardcoded", "hardcoded_secret"),
+    )
+    for keyword, family in keyword_families:
+        if keyword in text:
+            return family
+    return ""
+
+
+def _normalise_family(value: str) -> str:
+    text = str(value or "").strip().lower().replace("-", "_")
+    aliases = {
+        "double_free": "lifetime",
+        "partial_cleanup": "lifetime",
+        "stale_metadata": "lifetime",
+        "refcount_mismatch": "lifetime",
+        "use_after_free": "lifetime",
+        "memory_bounds": "memory_bounds",
+        "out_of_bounds": "memory_bounds",
+        "missing_validation": "memory_bounds",
+        "missing_auth": "authorization",
+        "permission_mismatch": "authorization",
+        "auth_logic_error": "authorization",
+        "state_ordering": "state_order",
+    }
+    return aliases.get(text, text)
+
+
+def _issue_similarity(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return _jaccard(_duplicate_tokens(a), _duplicate_tokens(b))
+
+
+def _canonical_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    return _jaccard(_token_set(a), _token_set(b))
+
+
+def _duplicate_tokens(issue: dict[str, Any]) -> set[str]:
+    return _token_set(_issue_text(issue))
+
+
+def _issue_text(issue: dict[str, Any]) -> str:
+    return " ".join(
+        str(issue.get(field) or "")
+        for field in (
+            "issue",
+            "reasoning",
+            "mitigation",
+            "code_snippet",
+            "primary_function",
+            "analysis_type",
+            "cwe",
+            "llm_triage_reason",
+            "llm_triage_exploitability",
+        )
+    )
+
+
+_DUPLICATE_STOPWORDS = _STOPWORDS | {
+    "analysis",
+    "candidate",
+    "canonical",
+    "connected",
+    "confidence",
+    "context",
+    "evidence",
+    "finding",
+    "function",
+    "functions",
+    "issue",
+    "line",
+    "location",
+    "mitigation",
+    "path",
+    "primary",
+    "reason",
+    "root",
+    "severity",
+}
+
+
+def _token_set(text: str) -> set[str]:
+    return {
+        token.lower()
+        for token in _TOKEN_RE.findall(str(text or ""))
+        if token.lower() not in _DUPLICATE_STOPWORDS
+    }
+
+
+def _is_additional_issue(issue: dict[str, Any]) -> bool:
+    return str(issue.get("id") or "").startswith("A")
 
 
 def _search_queries_for_issue(issue: dict[str, Any]) -> list[str]:

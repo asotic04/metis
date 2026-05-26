@@ -576,6 +576,11 @@ def pretty_print_reviews(results, quiet=False):
                         f"    [cyan]Line number:[/cyan] {r['line_number']}",
                         quiet,
                     )
+                if priority := r.get("priority"):
+                    print_console(
+                        f"    [bright_black]Priority:[/bright_black] [bold]{escape(str(priority).upper())}[/bold]",
+                        quiet,
+                    )
                 if r.get("cwe"):
                     cwe_text = str(r["cwe"])
                     match = re.search(r"(\d+)", cwe_text)
