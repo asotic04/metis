@@ -165,6 +165,10 @@ def generate_sarif(
             if isinstance(severity, str) and severity.strip():
                 properties["severity"] = severity.strip()
 
+            priority = issue.get("priority")
+            if isinstance(priority, str) and priority.strip():
+                properties["priority"] = priority.strip()
+
             reasoning = issue.get("reasoning")
             if reasoning:
                 properties["reasoning"] = str(reasoning)

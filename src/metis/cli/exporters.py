@@ -50,6 +50,7 @@ def export_csv(report_data, output_path: Path) -> Path:
             [
                 "File",
                 "Line",
+                "Priority",
                 "Severity",
                 "CWE",
                 "Issue",
@@ -63,6 +64,7 @@ def export_csv(report_data, output_path: Path) -> Path:
                 [
                     issue.get("file", ""),
                     issue.get("line", ""),
+                    issue.get("priority", ""),
                     issue.get("severity", ""),
                     issue.get("cwe", ""),
                     issue.get("issue", ""),
@@ -197,6 +199,7 @@ def _flatten_issues(report_data) -> list[dict]:
                 {
                     "file": file_name,
                     "line": str(issue.get("line_number") or ""),
+                    "priority": _coerce_to_string(issue.get("priority")).upper(),
                     "severity": severity,
                     "cwe": cwe,
                     "cweLink": cwe_link,
