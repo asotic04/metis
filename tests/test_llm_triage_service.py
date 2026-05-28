@@ -10,12 +10,12 @@ from metis.engine import llm_triage_service
 from metis.engine.llm_triage_service import LlmTriageService
 
 
-def test_llm_triage_prompt_uses_issue_tracker_priority_scale():
+def test_llm_triage_prompt_uses_metis_priority_rubric():
     prompt = llm_triage_service._TRIAGE_SYSTEM_PROMPT
 
-    assert "Default priority scale" in prompt
-    assert "p0: address immediately" in prompt
-    assert "p2: address on a reasonable timescale" in prompt
+    assert "Metis default priority rubric" in prompt
+    assert "p0: emergency response" in prompt
+    assert "p2: normal security priority" in prompt
     assert "This is the default for kept real security" in prompt
     assert "p5: Metis-only filtered state" in prompt
 
@@ -153,6 +153,100 @@ def test_llm_triage_keeps_omitted_decisions_conservatively(monkeypatch, tmp_path
 
     assert payload["issues"][0]["priority"] == "p4"
     assert "omitted" in payload["issues"][0]["llm_triage_reason"]
+
+
+def test_llm_triage_keeps_representative_when_duplicate_cluster_all_filtered(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "config_loader.cpp"
+    source.write_text(
+        """
+std::string LoadTemplate(const std::string& template_name) {
+  const std::string path = config_root + "/" + template_name + ".cfg";
+  std::ifstream input(path);
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        llm_triage_service,
+        "_invoke_triage_prompt",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "decisions": [
+                    {
+                        "id": "F001",
+                        "priority": "p5",
+                        "keep": False,
+                        "duplicate_of": None,
+                        "reason": "Duplicate/no context.",
+                        "exploitability": "Not assessed.",
+                    },
+                    {
+                        "id": "F002",
+                        "priority": "p5",
+                        "keep": False,
+                        "duplicate_of": "F001",
+                        "reason": "Duplicate.",
+                        "exploitability": "Not assessed.",
+                    },
+                ]
+            }
+        ),
+    )
+
+    service = LlmTriageService(
+        codebase_path=tmp_path,
+        llm_provider=object(),
+        usage_runtime=SimpleNamespace(),
+    )
+    payload = service.triage_review_results(
+        {
+            "reviews": [
+                {
+                    "file": "config_loader.cpp",
+                    "file_path": str(source),
+                    "reviews": [
+                        {
+                            "issue": "Path traversal in LoadTemplate",
+                            "line_number": 3,
+                            "primary_file": "config_loader.cpp",
+                            "primary_function": "LoadTemplate",
+                            "severity": "High",
+                            "confidence": 0.95,
+                            "cwe": "CWE-22",
+                            "reasoning": (
+                                "template_name is concatenated into a path and opened."
+                            ),
+                        },
+                        {
+                            "issue": "Untrusted template path is opened",
+                            "line_number": 3,
+                            "primary_file": "config_loader.cpp",
+                            "primary_function": "LoadTemplate",
+                            "severity": "High",
+                            "confidence": 0.95,
+                            "cwe": "CWE-22",
+                            "reasoning": (
+                                "caller-controlled template_name can escape the root."
+                            ),
+                        },
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert payload["summary"]["total_input_findings"] == 2
+    assert payload["summary"]["kept_findings"] == 1
+    assert payload["summary"]["kept_input_findings"] == 1
+    assert payload["summary"]["filtered_findings"] == 1
+    assert payload["issues"][0]["id"] == "F001"
+    assert payload["issues"][0]["priority"] == "p3"
+    assert "high-confidence same-location duplicate cluster" in payload["issues"][0][
+        "llm_triage_reason"
+    ]
 
 
 def test_llm_triage_accepts_additional_findings(monkeypatch, tmp_path):
