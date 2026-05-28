@@ -480,6 +480,35 @@ class LlmTriageService:
             seen_duplicate_keys.add(duplicate_key)
             kept.append(issue)
 
+        if not kept:
+            representative = _filtered_duplicate_cluster_representative(
+                findings,
+                decisions_by_id,
+            )
+            if representative is not None:
+                finding, priority = representative
+                kept.append(
+                    _triaged_issue(
+                        finding,
+                        {
+                            "priority": priority,
+                            "keep": True,
+                            "duplicate_of": None,
+                            "reason": (
+                                "LLM triage filtered every finding in a high-confidence "
+                                "same-location duplicate cluster; kept the strongest "
+                                "representative conservatively."
+                            ),
+                            "exploitability": (
+                                "Same prerequisites as the original finding; multiple "
+                                "independent reports agreed on this location and "
+                                "vulnerability family."
+                            ),
+                        },
+                        priority,
+                    )
+                )
+
         kept, collapsed_duplicates = _consolidate_triaged_issues(kept)
         dropped += collapsed_duplicates
         kept.sort(key=_triaged_issue_sort_key)
@@ -860,6 +889,101 @@ def _confidence_value(value: Any) -> float:
         return float(text)
     except ValueError:
         return {"high": 0.95, "medium": 0.75, "low": 0.5}.get(text, 0.0)
+
+
+_SECURITY_FAMILIES_FOR_CLUSTER_RESCUE = frozenset(
+    {
+        "authentication",
+        "authorization",
+        "command_injection",
+        "credential_storage",
+        "format_string",
+        "hardcoded_secret",
+        "information_disclosure",
+        "integer_overflow",
+        "lifetime",
+        "memory_bounds",
+        "path_traversal",
+        "sql_injection",
+        "unsafe_deserialization",
+    }
+)
+
+
+def _filtered_duplicate_cluster_representative(
+    findings: list[_FindingRecord],
+    decisions_by_id: dict[str, dict[str, Any]],
+) -> tuple[_FindingRecord, str] | None:
+    clusters: dict[tuple[Any, ...], list[_FindingRecord]] = {}
+    for finding in findings:
+        decision = decisions_by_id.get(finding.id, {})
+        priority = _normalize_priority(decision.get("priority"))
+        keep = bool(decision.get("keep", priority != "p5"))
+        if priority != "p5" and keep and not _clean_optional_text(
+            decision.get("duplicate_of")
+        ):
+            return None
+
+        family = _issue_family(finding.issue)
+        if family not in _SECURITY_FAMILIES_FOR_CLUSTER_RESCUE:
+            continue
+        if not _is_strong_security_finding(finding):
+            continue
+
+        key = (
+            finding.file.replace("\\", "/").lstrip("./"),
+            finding.line_number,
+            _issue_function(finding.issue),
+            family,
+        )
+        clusters.setdefault(key, []).append(finding)
+
+    duplicate_clusters = [cluster for cluster in clusters.values() if len(cluster) >= 2]
+    if not duplicate_clusters:
+        return None
+
+    best_cluster = max(
+        duplicate_clusters,
+        key=lambda cluster: max(_finding_strength_key(finding) for finding in cluster),
+    )
+    representative = max(best_cluster, key=_finding_strength_key)
+    return representative, _conservative_rescue_priority(representative)
+
+
+def _is_strong_security_finding(finding: _FindingRecord) -> bool:
+    issue = finding.issue
+    severity = str(issue.get("severity") or "").strip().lower()
+    confidence = _confidence_value(issue.get("confidence"))
+    if severity in {"critical", "high"} and confidence >= 0.70:
+        return True
+    return confidence >= 0.90 and bool(_issue_family(issue))
+
+
+def _finding_strength_key(finding: _FindingRecord) -> tuple[Any, ...]:
+    issue = finding.issue
+    severity = str(issue.get("severity") or "").strip().lower()
+    return (
+        -_SEVERITY_RANK.get(severity, 99),
+        _confidence_value(issue.get("confidence")),
+        -finding.line_number,
+    )
+
+
+def _conservative_rescue_priority(finding: _FindingRecord) -> str:
+    issue = finding.issue
+    severity = str(issue.get("severity") or "").strip().lower()
+    family = _issue_family(issue)
+    if severity == "critical":
+        return "p2"
+    if family in {
+        "command_injection",
+        "sql_injection",
+        "unsafe_deserialization",
+        "memory_bounds",
+        "lifetime",
+    }:
+        return "p2"
+    return "p3"
 
 
 def _dedupe_key(finding: _FindingRecord) -> tuple[Any, ...]:
