@@ -119,6 +119,32 @@ def build_engine(args, runtime):
     return engine, vector_backend
 
 
+def apply_llm_triage_config(args, runtime):
+    llm_triage_enabled = bool(runtime.get("llm_triage_enabled", False))
+    if llm_triage_enabled:
+        args.llm_triage = True
+
+    if getattr(args, "llm_triage_model", None) is None:
+        configured_model = runtime.get("llm_triage_model")
+        if configured_model:
+            args.llm_triage_model = str(configured_model)
+
+    if getattr(args, "llm_triage_reasoning_effort", None) is None:
+        configured_effort = runtime.get("llm_triage_reasoning_effort")
+        if configured_effort:
+            args.llm_triage_reasoning_effort = str(configured_effort)
+
+    if getattr(args, "llm_triage_batch_size", None) is None:
+        configured_batch_size = runtime.get("llm_triage_batch_size")
+        if configured_batch_size is not None:
+            args.llm_triage_batch_size = configured_batch_size
+
+    if getattr(args, "llm_triage_output_file", None) is None:
+        configured_output_file = runtime.get("llm_triage_output_file")
+        if configured_output_file:
+            args.llm_triage_output_file = str(configured_output_file)
+
+
 def finalize_cli_session(engine, args):
     if getattr(args, "_metis_usage_finalized", False):
         return None
@@ -375,13 +401,13 @@ def main():
     parser.add_argument(
         "--llm-triage-reasoning-effort",
         type=str,
-        default="high",
+        default=None,
         help="Reasoning effort for --llm-triage (default: high).",
     )
     parser.add_argument(
         "--llm-triage-batch-size",
         type=int,
-        default=10,
+        default=None,
         help="Findings per --llm-triage batch after similarity sorting (default: 10).",
     )
     parser.add_argument(
@@ -425,6 +451,7 @@ def main():
 
     configure_logger(logger, args)
     runtime = load_runtime_config(enable_psql=(args.backend == "postgres"))
+    apply_llm_triage_config(args, runtime)
     engine, vector_backend = build_engine(args, runtime)
     exit_code = 0
     farewell = None

@@ -264,6 +264,13 @@ def load_runtime_config(config_path=None, enable_psql=False):
     )
     runtime.update(collect_reachability_config(cfg, engine_cfg))
 
+    llm_triage_cfg = cfg.get("llm_triage", {}) or {}
+    runtime["llm_triage_enabled"] = bool(llm_triage_cfg.get("enabled", False))
+    runtime["llm_triage_model"] = llm_triage_cfg.get("model")
+    runtime["llm_triage_reasoning_effort"] = llm_triage_cfg.get("reasoning_effort")
+    runtime["llm_triage_batch_size"] = llm_triage_cfg.get("batch_size")
+    runtime["llm_triage_output_file"] = llm_triage_cfg.get("output_file")
+
     # Query config
     query_cfg = cfg.get("query", {})
     runtime["llama_query_model"] = query_cfg.get("model") or runtime.get("model", "")
