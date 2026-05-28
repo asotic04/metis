@@ -407,13 +407,11 @@ def _review_results_from_llm_triage_payload(results: dict, payload: dict | None)
                     "file": file_name,
                     "file_path": file_path,
                     "reviews": [],
+                    "llm_triage_filtered_reviews": [],
                 },
             )
 
-    for issue in issues:
-        if not isinstance(issue, dict):
-            continue
-        issue_copy = copy.deepcopy(issue)
+    def _entry_for_issue(issue_copy: dict) -> dict:
         file_name = str(
             issue_copy.get("file")
             or issue_copy.get("primary_file")
@@ -428,19 +426,42 @@ def _review_results_from_llm_triage_payload(results: dict, payload: dict | None)
                 "file": file_name,
                 "file_path": file_path,
                 "reviews": [],
+                "llm_triage_filtered_reviews": [],
             },
         )
         if not entry.get("file") and file_name:
             entry["file"] = file_name
         if not entry.get("file_path") and file_path:
             entry["file_path"] = file_path
-        entry["reviews"].append(issue_copy)
+        entry.setdefault("llm_triage_filtered_reviews", [])
+        return entry
+
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        issue_copy = copy.deepcopy(issue)
+        _entry_for_issue(issue_copy)["reviews"].append(issue_copy)
+
+    filtered_issues = payload.get("filtered_issues")
+    if isinstance(filtered_issues, list):
+        for issue in filtered_issues:
+            if not isinstance(issue, dict):
+                continue
+            issue_copy = copy.deepcopy(issue)
+            _entry_for_issue(issue_copy)["llm_triage_filtered_reviews"].append(
+                issue_copy
+            )
 
     final_results = copy.deepcopy(results) if isinstance(results, dict) else {}
     final_results["reviews"] = [
-        entry for entry in grouped.values() if entry.get("reviews")
+        entry
+        for entry in grouped.values()
+        if entry.get("reviews") or entry.get("llm_triage_filtered_reviews")
     ]
     final_results["llm_triage_summary"] = copy.deepcopy(payload.get("summary") or {})
+    final_results["llm_triage_filtered_issues"] = copy.deepcopy(
+        filtered_issues if isinstance(filtered_issues, list) else []
+    )
     return final_results
 
 

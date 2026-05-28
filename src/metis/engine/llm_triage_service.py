@@ -441,6 +441,7 @@ class LlmTriageService:
         errors: list[dict[str, Any]],
     ) -> dict[str, Any]:
         kept = []
+        filtered = []
         dropped = 0
         seen_duplicate_keys: set[tuple[Any, ...]] = set()
 
@@ -453,10 +454,29 @@ class LlmTriageService:
             duplicate_of = _clean_optional_text(decision.get("duplicate_of"))
             if priority == "p5" or not keep or duplicate_of:
                 dropped += 1
+                filtered.append(_filtered_triage_issue(finding, decision, priority))
                 continue
             duplicate_key = _dedupe_key(finding)
             if duplicate_key in seen_duplicate_keys:
                 dropped += 1
+                filtered.append(
+                    _filtered_triage_issue(
+                        finding,
+                        {
+                            "priority": "p5",
+                            "keep": False,
+                            "duplicate_of": None,
+                            "reason": (
+                                "Filtered by deterministic duplicate consolidation "
+                                "after LLM triage kept an equivalent finding."
+                            ),
+                            "exploitability": str(
+                                decision.get("exploitability") or ""
+                            ).strip(),
+                        },
+                        "p5",
+                    )
+                )
                 continue
             seen_duplicate_keys.add(duplicate_key)
             kept.append(_triaged_issue(finding, decision, priority))
@@ -487,6 +507,11 @@ class LlmTriageService:
             )
             if representative is not None:
                 finding, priority = representative
+                filtered = [
+                    issue
+                    for issue in filtered
+                    if str(issue.get("id") or "") != finding.id
+                ]
                 kept.append(
                     _triaged_issue(
                         finding,
@@ -531,6 +556,7 @@ class LlmTriageService:
                 "errors": errors,
             },
             "issues": kept,
+            "filtered_issues": filtered,
         }
 
 
@@ -764,6 +790,17 @@ def _triaged_issue(
     return item
 
 
+def _filtered_triage_issue(
+    finding: _FindingRecord,
+    decision: dict[str, Any],
+    priority: str,
+) -> dict[str, Any]:
+    item = _triaged_issue(finding, decision, priority)
+    item["llm_triage_filtered"] = True
+    item["llm_triage_keep"] = False
+    return item
+
+
 def _additional_issue(
     additional: dict[str, Any],
     index: int,
@@ -915,6 +952,7 @@ def _filtered_duplicate_cluster_representative(
     decisions_by_id: dict[str, dict[str, Any]],
 ) -> tuple[_FindingRecord, str] | None:
     clusters: dict[tuple[Any, ...], list[_FindingRecord]] = {}
+    strong_findings: list[_FindingRecord] = []
     for finding in findings:
         decision = decisions_by_id.get(finding.id, {})
         priority = _normalize_priority(decision.get("priority"))
@@ -929,6 +967,7 @@ def _filtered_duplicate_cluster_representative(
             continue
         if not _is_strong_security_finding(finding):
             continue
+        strong_findings.append(finding)
 
         key = (
             finding.file.replace("\\", "/").lstrip("./"),
@@ -939,14 +978,19 @@ def _filtered_duplicate_cluster_representative(
         clusters.setdefault(key, []).append(finding)
 
     duplicate_clusters = [cluster for cluster in clusters.values() if len(cluster) >= 2]
-    if not duplicate_clusters:
-        return None
+    if duplicate_clusters:
+        best_cluster = max(
+            duplicate_clusters,
+            key=lambda cluster: max(
+                _finding_strength_key(finding) for finding in cluster
+            ),
+        )
+        representative = max(best_cluster, key=_finding_strength_key)
+        return representative, _conservative_rescue_priority(representative)
 
-    best_cluster = max(
-        duplicate_clusters,
-        key=lambda cluster: max(_finding_strength_key(finding) for finding in cluster),
-    )
-    representative = max(best_cluster, key=_finding_strength_key)
+    if not strong_findings:
+        return None
+    representative = max(strong_findings, key=_finding_strength_key)
     return representative, _conservative_rescue_priority(representative)
 
 
