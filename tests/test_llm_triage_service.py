@@ -228,6 +228,43 @@ def test_llm_triage_keeps_omitted_decision_when_retry_returns_it(
     assert payload["issues"][0]["priority"] == "p2"
 
 
+def test_llm_triage_filters_batch_when_prompt_fails(monkeypatch, tmp_path):
+    source = tmp_path / "driver.c"
+    source.write_text("int maybe_bug(void) { return 1; }\n", encoding="utf-8")
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(llm_triage_service, "_invoke_triage_prompt", _raise)
+
+    service = LlmTriageService(
+        codebase_path=tmp_path,
+        llm_provider=object(),
+        usage_runtime=SimpleNamespace(),
+    )
+    payload = service.triage_review_results(
+        {
+            "reviews": [
+                {
+                    "file": "driver.c",
+                    "file_path": str(source),
+                    "reviews": [{"issue": "Maybe bug", "line_number": 1}],
+                }
+            ]
+        }
+    )
+
+    assert payload["summary"]["kept_input_findings"] == 0
+    assert payload["summary"]["filtered_findings"] == 1
+    assert payload["summary"]["errors"][0]["error"].endswith("model unavailable")
+    assert payload["issues"] == []
+    assert payload["filtered_issues"][0]["id"] == "F001"
+    assert payload["filtered_issues"][0]["priority"] == "p5"
+    assert "failed for this batch" in payload["filtered_issues"][0][
+        "llm_triage_reason"
+    ]
+
+
 def test_llm_triage_keeps_representative_when_duplicate_cluster_all_filtered(
     monkeypatch, tmp_path
 ):

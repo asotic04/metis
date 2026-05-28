@@ -262,9 +262,10 @@ class LlmTriageService:
                     }
                 )
                 decisions = {
-                    finding.id: _fallback_decision(
+                    finding.id: _triage_failed_decision(
                         finding.id,
-                        "LLM triage failed; kept conservatively as p4.",
+                        "LLM triage failed for this batch; filtered because no "
+                        "positive triage decision was available.",
                     )
                     for finding in batch
                 }
@@ -734,11 +735,11 @@ def _parse_additional_findings(raw_items) -> list[dict[str, Any]]:
     return additions
 
 
-def _fallback_decision(finding_id: str, reason: str) -> dict[str, Any]:
+def _triage_failed_decision(finding_id: str, reason: str) -> dict[str, Any]:
     return {
         "id": finding_id,
-        "priority": "p4",
-        "keep": True,
+        "priority": "p5",
+        "keep": False,
         "duplicate_of": None,
         "reason": reason,
         "exploitability": "Not assessed by LLM triage.",
