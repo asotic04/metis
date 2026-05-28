@@ -382,6 +382,7 @@ def _run_llm_triage_if_requested(engine, results, args, runtime: CommandRuntime)
             model=model,
             reasoning_effort=reasoning_effort,
             batch_size=batch_size,
+            phase="cli_llm_triage",
             error=f"{type(exc).__name__}: {exc}",
         )
 
@@ -408,6 +409,7 @@ def _llm_triage_failure_payload(
     model: str,
     reasoning_effort: str,
     batch_size: int,
+    phase: str,
     error: str,
 ) -> dict:
     filtered_issues = []
@@ -435,13 +437,15 @@ def _llm_triage_failure_payload(
                 )
                 issue_copy["file_path"] = str(issue_copy.get("file_path") or file_path)
                 issue_copy["llm_triage_reason"] = (
-                    "LLM triage failed before producing a decision; filtered because "
+                    f"LLM triage failed during {phase}; filtered because "
                     "triage was requested and no positive triage decision was available."
                 )
                 issue_copy["llm_triage_exploitability"] = (
                     "Not assessed because LLM triage failed."
                 )
                 issue_copy["llm_triage_duplicate_of"] = None
+                issue_copy["llm_triage_failure_phase"] = phase
+                issue_copy["llm_triage_error"] = error
                 issue_copy["llm_triage_filtered"] = True
                 issue_copy["llm_triage_keep"] = False
                 filtered_issues.append(issue_copy)
@@ -459,7 +463,7 @@ def _llm_triage_failure_payload(
             "filtered_findings": len(filtered_issues),
             "additional_findings": 0,
             "omitted_findings": 0,
-            "errors": [{"error": error}],
+            "errors": [{"phase": phase, "error": error}],
         },
         "issues": [],
         "filtered_issues": filtered_issues,

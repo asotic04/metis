@@ -376,7 +376,7 @@ def test_finalize_review_output_fails_llm_triage_closed(monkeypatch, tmp_path):
                     "line_number": 7,
                     "issue": "Raw issue",
                     "llm_triage_reason": (
-                        "LLM triage failed before producing a decision; filtered "
+                        "LLM triage failed during cli_llm_triage; filtered "
                         "because triage was requested and no positive triage "
                         "decision was available."
                     ),
@@ -384,11 +384,16 @@ def test_finalize_review_output_fails_llm_triage_closed(monkeypatch, tmp_path):
                         "Not assessed because LLM triage failed."
                     ),
                     "llm_triage_duplicate_of": None,
+                    "llm_triage_failure_phase": "cli_llm_triage",
+                    "llm_triage_error": "RuntimeError: model unavailable",
                     "llm_triage_filtered": True,
                     "llm_triage_keep": False,
                 }
             ],
         }
+    ]
+    assert saved["llm_triage_summary"]["errors"] == [
+        {"phase": "cli_llm_triage", "error": "RuntimeError: model unavailable"}
     ]
     triage_payload = json.loads(triage_path.read_text(encoding="utf-8"))
     assert triage_payload["issues"] == []

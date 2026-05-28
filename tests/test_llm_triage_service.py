@@ -236,6 +236,7 @@ def test_llm_triage_filters_batch_when_prompt_fails(monkeypatch, tmp_path):
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(llm_triage_service, "_invoke_triage_prompt", _raise)
+    monkeypatch.setattr(llm_triage_service, "_triage_retry_sleep", lambda _delay: None)
 
     service = LlmTriageService(
         codebase_path=tmp_path,
@@ -256,13 +257,136 @@ def test_llm_triage_filters_batch_when_prompt_fails(monkeypatch, tmp_path):
 
     assert payload["summary"]["kept_input_findings"] == 0
     assert payload["summary"]["filtered_findings"] == 1
+    assert payload["summary"]["errors"][0]["phase"] == "batch_invoke"
+    assert len(payload["summary"]["errors"][0]["attempts"]) == 3
     assert payload["summary"]["errors"][0]["error"].endswith("model unavailable")
     assert payload["issues"] == []
     assert payload["filtered_issues"][0]["id"] == "F001"
     assert payload["filtered_issues"][0]["priority"] == "p5"
-    assert "failed for this batch" in payload["filtered_issues"][0][
-        "llm_triage_reason"
+    assert payload["filtered_issues"][0]["llm_triage_failure_phase"] == "batch_invoke"
+    assert payload["filtered_issues"][0]["llm_triage_error"].endswith(
+        "model unavailable"
+    )
+
+
+def test_llm_triage_retries_transient_prompt_failure(monkeypatch, tmp_path):
+    source = tmp_path / "driver.c"
+    source.write_text("int real_bug(char *p) { return p[64]; }\n", encoding="utf-8")
+    calls = {"count": 0}
+
+    def _flaky(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise RuntimeError("rate limited")
+        return json.dumps(
+            {
+                "decisions": [
+                    {
+                        "id": "F001",
+                        "priority": "p2",
+                        "keep": True,
+                        "duplicate_of": None,
+                        "reason": "Real out-of-bounds read.",
+                        "exploitability": "Caller controls p.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(llm_triage_service, "_invoke_triage_prompt", _flaky)
+    monkeypatch.setattr(llm_triage_service, "_triage_retry_sleep", lambda _delay: None)
+
+    service = LlmTriageService(
+        codebase_path=tmp_path,
+        llm_provider=object(),
+        usage_runtime=SimpleNamespace(),
+    )
+    payload = service.triage_review_results(
+        {
+            "reviews": [
+                {
+                    "file": "driver.c",
+                    "file_path": str(source),
+                    "reviews": [
+                        {
+                            "issue": "Out-of-bounds read",
+                            "line_number": 1,
+                            "severity": "High",
+                            "confidence": 0.95,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert calls["count"] == 3
+    assert payload["summary"]["errors"] == []
+    assert payload["issues"][0]["id"] == "F001"
+    assert payload["issues"][0]["priority"] == "p2"
+
+
+def test_llm_triage_reports_build_payload_failure_phase(monkeypatch, tmp_path):
+    source = tmp_path / "driver.c"
+    source.write_text("int real_bug(char *p) { return p[64]; }\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        llm_triage_service,
+        "_invoke_triage_prompt",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "decisions": [
+                    {
+                        "id": "F001",
+                        "priority": "p2",
+                        "keep": True,
+                        "duplicate_of": None,
+                        "reason": "Real out-of-bounds read.",
+                        "exploitability": "Caller controls p.",
+                    }
+                ]
+            }
+        ),
+    )
+
+    def _raise(_issues):
+        raise RuntimeError("dedupe failed")
+
+    monkeypatch.setattr(llm_triage_service, "_consolidate_triaged_issues", _raise)
+
+    service = LlmTriageService(
+        codebase_path=tmp_path,
+        llm_provider=object(),
+        usage_runtime=SimpleNamespace(),
+    )
+    payload = service.triage_review_results(
+        {
+            "reviews": [
+                {
+                    "file": "driver.c",
+                    "file_path": str(source),
+                    "reviews": [
+                        {
+                            "issue": "Out-of-bounds read",
+                            "line_number": 1,
+                            "severity": "High",
+                            "confidence": 0.95,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert payload["summary"]["kept_input_findings"] == 0
+    assert payload["summary"]["filtered_findings"] == 1
+    assert payload["summary"]["errors"] == [
+        {"phase": "build_payload", "error": "RuntimeError: dedupe failed"}
     ]
+    assert payload["filtered_issues"][0]["llm_triage_failure_phase"] == "build_payload"
+    assert payload["filtered_issues"][0]["llm_triage_error"] == (
+        "RuntimeError: dedupe failed"
+    )
 
 
 def test_llm_triage_keeps_representative_when_duplicate_cluster_all_filtered(
