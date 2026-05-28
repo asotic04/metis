@@ -116,6 +116,7 @@ int noisy_warning(void) {
     assert calls[0]["model"] == "gpt-test"
     assert calls[0]["reasoning_effort"] == "high"
     assert payload["summary"]["total_input_findings"] == 2
+    assert payload["summary"]["errors"] == []
     assert payload["summary"]["kept_findings"] == 1
     assert payload["summary"]["kept_input_findings"] == 1
     assert payload["summary"]["filtered_findings"] == 1
@@ -473,6 +474,7 @@ std::string LoadTemplate(const std::string& template_name) {
     )
 
     assert payload["summary"]["total_input_findings"] == 2
+    assert payload["summary"]["errors"] == []
     assert payload["summary"]["kept_findings"] == 1
     assert payload["summary"]["kept_input_findings"] == 1
     assert payload["summary"]["filtered_findings"] == 1

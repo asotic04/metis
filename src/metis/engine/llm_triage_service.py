@@ -1303,7 +1303,6 @@ def _filtered_duplicate_cluster_representative(
             continue
         if not _is_strong_security_finding(finding):
             continue
-        strong_findings.append(finding)
 
         key = (
             finding.file.replace("\\", "/").lstrip("./"),
