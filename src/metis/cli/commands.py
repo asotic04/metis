@@ -369,18 +369,101 @@ def _run_llm_triage_if_requested(engine, results, args, runtime: CommandRuntime)
                 progress_callback=_progress,
                 quiet=args.quiet,
             )
+    except Exception as exc:
+        print_console(
+            (
+                "[yellow]LLM triage failed closed due to error: "
+                f"{escape(str(exc))}[/yellow]"
+            ),
+            args.quiet,
+        )
+        payload = _llm_triage_failure_payload(
+            results,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            batch_size=batch_size,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    try:
         _write_llm_triage_output(
             payload,
             _resolve_llm_triage_output_path(args, runtime),
             args.quiet,
         )
-        return payload
     except Exception as exc:
         print_console(
-            f"[yellow]LLM triage skipped due to error: {escape(str(exc))}[/yellow]",
+            (
+                "[yellow]LLM triage output was not written due to error: "
+                f"{escape(str(exc))}[/yellow]"
+            ),
             args.quiet,
         )
-        return None
+    return payload
+
+
+def _llm_triage_failure_payload(
+    results: dict,
+    *,
+    model: str,
+    reasoning_effort: str,
+    batch_size: int,
+    error: str,
+) -> dict:
+    filtered_issues = []
+    reviews = results.get("reviews") if isinstance(results, dict) else None
+    if isinstance(reviews, list):
+        next_id = 1
+        for file_entry in reviews:
+            if not isinstance(file_entry, dict):
+                continue
+            file_name = str(file_entry.get("file") or "")
+            file_path = str(file_entry.get("file_path") or "")
+            issues = file_entry.get("reviews")
+            if not isinstance(issues, list):
+                continue
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                issue_copy = copy.deepcopy(issue)
+                issue_copy["id"] = f"F{next_id:03d}"
+                issue_copy["priority"] = "p5"
+                issue_copy["file"] = str(
+                    issue_copy.get("file")
+                    or issue_copy.get("primary_file")
+                    or file_name
+                )
+                issue_copy["file_path"] = str(issue_copy.get("file_path") or file_path)
+                issue_copy["llm_triage_reason"] = (
+                    "LLM triage failed before producing a decision; filtered because "
+                    "triage was requested and no positive triage decision was available."
+                )
+                issue_copy["llm_triage_exploitability"] = (
+                    "Not assessed because LLM triage failed."
+                )
+                issue_copy["llm_triage_duplicate_of"] = None
+                issue_copy["llm_triage_filtered"] = True
+                issue_copy["llm_triage_keep"] = False
+                filtered_issues.append(issue_copy)
+                next_id += 1
+
+    return {
+        "summary": {
+            "schema_version": 1,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "batch_size": batch_size,
+            "total_input_findings": len(filtered_issues),
+            "kept_findings": 0,
+            "kept_input_findings": 0,
+            "filtered_findings": len(filtered_issues),
+            "additional_findings": 0,
+            "omitted_findings": 0,
+            "errors": [{"error": error}],
+        },
+        "issues": [],
+        "filtered_issues": filtered_issues,
+    }
 
 
 def _review_results_from_llm_triage_payload(results: dict, payload: dict | None) -> dict:
