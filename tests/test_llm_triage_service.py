@@ -124,14 +124,16 @@ int noisy_warning(void) {
     assert payload["issues"][0]["llm_triage_reason"].startswith("Direct")
 
 
-def test_llm_triage_keeps_omitted_decisions_conservatively(monkeypatch, tmp_path):
+def test_llm_triage_retries_then_filters_omitted_decisions(monkeypatch, tmp_path):
     source = tmp_path / "driver.c"
     source.write_text("int maybe_bug(void) { return 1; }\n", encoding="utf-8")
+
+    calls = []
 
     monkeypatch.setattr(
         llm_triage_service,
         "_invoke_triage_prompt",
-        lambda *_args, **_kwargs: '{"decisions": []}',
+        lambda *_args, **kwargs: calls.append(kwargs) or '{"decisions": []}',
     )
 
     service = LlmTriageService(
@@ -151,8 +153,79 @@ def test_llm_triage_keeps_omitted_decisions_conservatively(monkeypatch, tmp_path
         }
     )
 
-    assert payload["issues"][0]["priority"] == "p4"
-    assert "omitted" in payload["issues"][0]["llm_triage_reason"]
+    assert len(calls) == 2
+    assert payload["summary"]["kept_input_findings"] == 0
+    assert payload["summary"]["filtered_findings"] == 1
+    assert payload["summary"]["omitted_findings"] == 1
+    assert payload["issues"] == []
+    assert payload["filtered_issues"][0]["id"] == "F001"
+    assert payload["filtered_issues"][0]["priority"] == "p5"
+    assert "did not return a decision" in payload["filtered_issues"][0][
+        "llm_triage_reason"
+    ]
+
+
+def test_llm_triage_keeps_omitted_decision_when_retry_returns_it(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "driver.c"
+    source.write_text("int real_bug(char *p) { return p[64]; }\n", encoding="utf-8")
+
+    responses = iter(
+        [
+            '{"decisions": []}',
+            json.dumps(
+                {
+                    "decisions": [
+                        {
+                            "id": "F001",
+                            "priority": "p2",
+                            "keep": True,
+                            "duplicate_of": None,
+                            "reason": "Real out-of-bounds read.",
+                            "exploitability": "Caller controls p.",
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(
+        llm_triage_service,
+        "_invoke_triage_prompt",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    service = LlmTriageService(
+        codebase_path=tmp_path,
+        llm_provider=object(),
+        usage_runtime=SimpleNamespace(),
+    )
+    payload = service.triage_review_results(
+        {
+            "reviews": [
+                {
+                    "file": "driver.c",
+                    "file_path": str(source),
+                    "reviews": [
+                        {
+                            "issue": "Out-of-bounds read",
+                            "line_number": 1,
+                            "severity": "High",
+                            "confidence": 0.95,
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert payload["summary"]["kept_input_findings"] == 1
+    assert payload["summary"]["filtered_findings"] == 0
+    assert payload["summary"]["omitted_findings"] == 0
+    assert payload["issues"][0]["id"] == "F001"
+    assert payload["issues"][0]["priority"] == "p2"
 
 
 def test_llm_triage_keeps_representative_when_duplicate_cluster_all_filtered(
@@ -250,7 +323,7 @@ std::string LoadTemplate(const std::string& template_name) {
     assert [issue["id"] for issue in payload["filtered_issues"]] == ["F002"]
 
 
-def test_llm_triage_keeps_single_strong_finding_when_all_filtered(
+def test_llm_triage_does_not_rescue_single_strong_finding_when_all_filtered(
     monkeypatch, tmp_path
 ):
     source = tmp_path / "session_store.cpp"
@@ -315,11 +388,15 @@ std::string BuildAuditLine(std::string user_id, std::string session_id) {
         }
     )
 
-    assert payload["summary"]["kept_input_findings"] == 1
-    assert payload["summary"]["filtered_findings"] == 0
-    assert payload["issues"][0]["id"] == "F001"
-    assert payload["issues"][0]["priority"] == "p2"
-    assert payload["filtered_issues"] == []
+    assert payload["summary"]["kept_input_findings"] == 0
+    assert payload["summary"]["filtered_findings"] == 1
+    assert payload["issues"] == []
+    assert payload["filtered_issues"][0]["id"] == "F001"
+    assert payload["filtered_issues"][0]["priority"] == "p5"
+    assert (
+        payload["filtered_issues"][0]["llm_triage_reason"]
+        == "No external path shown."
+    )
 
 
 def test_llm_triage_accepts_additional_findings(monkeypatch, tmp_path):
