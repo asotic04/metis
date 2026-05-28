@@ -331,6 +331,17 @@ def test_finalize_review_output_saves_llm_triaged_review_report(
                         "severity": "High",
                     }
                 ],
+                "filtered_issues": [
+                    {
+                        "id": "F002",
+                        "priority": "p5",
+                        "file": "a.c",
+                        "file_path": "/repo/a.c",
+                        "line_number": 9,
+                        "issue": "Filtered issue",
+                        "llm_triage_reason": "Duplicate.",
+                    }
+                ],
             }
 
     args = SimpleNamespace(
@@ -401,6 +412,28 @@ def test_finalize_review_output_saves_llm_triaged_review_report(
                     "severity": "High",
                 }
             ],
+            "llm_triage_filtered_reviews": [
+                {
+                    "id": "F002",
+                    "priority": "p5",
+                    "file": "a.c",
+                    "file_path": "/repo/a.c",
+                    "line_number": 9,
+                    "issue": "Filtered issue",
+                    "llm_triage_reason": "Duplicate.",
+                }
+            ],
+        }
+    ]
+    assert saved["llm_triage_filtered_issues"] == [
+        {
+            "id": "F002",
+            "priority": "p5",
+            "file": "a.c",
+            "file_path": "/repo/a.c",
+            "line_number": 9,
+            "issue": "Filtered issue",
+            "llm_triage_reason": "Duplicate.",
         }
     ]
     assert json.loads(triage_path.read_text(encoding="utf-8"))["summary"][

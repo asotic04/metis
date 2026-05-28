@@ -247,6 +247,79 @@ std::string LoadTemplate(const std::string& template_name) {
     assert "high-confidence same-location duplicate cluster" in payload["issues"][0][
         "llm_triage_reason"
     ]
+    assert [issue["id"] for issue in payload["filtered_issues"]] == ["F002"]
+
+
+def test_llm_triage_keeps_single_strong_finding_when_all_filtered(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "session_store.cpp"
+    source.write_text(
+        """
+std::string BuildAuditLine(std::string user_id, std::string session_id) {
+  char buffer[64];
+  std::sprintf(buffer, "user=%s session=%s", user_id.c_str(), session_id.c_str());
+  return std::string(buffer);
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        llm_triage_service,
+        "_invoke_triage_prompt",
+        lambda *_args, **_kwargs: json.dumps(
+            {
+                "decisions": [
+                    {
+                        "id": "F001",
+                        "priority": "p5",
+                        "keep": False,
+                        "duplicate_of": None,
+                        "reason": "No external path shown.",
+                        "exploitability": "Not assessed.",
+                    }
+                ]
+            }
+        ),
+    )
+
+    service = LlmTriageService(
+        codebase_path=tmp_path,
+        llm_provider=object(),
+        usage_runtime=SimpleNamespace(),
+    )
+    payload = service.triage_review_results(
+        {
+            "reviews": [
+                {
+                    "file": "session_store.cpp",
+                    "file_path": str(source),
+                    "reviews": [
+                        {
+                            "issue": "sprintf into fixed stack buffer",
+                            "line_number": 3,
+                            "primary_file": "session_store.cpp",
+                            "primary_function": "BuildAuditLine",
+                            "severity": "High",
+                            "confidence": 0.95,
+                            "cwe": "CWE-120",
+                            "reasoning": (
+                                "user_id and session_id are formatted into a "
+                                "64-byte stack buffer with sprintf."
+                            ),
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert payload["summary"]["kept_input_findings"] == 1
+    assert payload["summary"]["filtered_findings"] == 0
+    assert payload["issues"][0]["id"] == "F001"
+    assert payload["issues"][0]["priority"] == "p2"
+    assert payload["filtered_issues"] == []
 
 
 def test_llm_triage_accepts_additional_findings(monkeypatch, tmp_path):
