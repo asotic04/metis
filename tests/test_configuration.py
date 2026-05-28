@@ -50,6 +50,35 @@ query:
     assert runtime["llama_query_max_tokens"] == 3072
 
 
+def test_load_runtime_config_reads_llm_triage_settings(tmp_path, monkeypatch):
+    config_path = tmp_path / "metis.yaml"
+    config_path.write_text(
+        """
+llm_provider:
+  name: openai
+  model: gpt-test
+  code_embedding_model: text-embedding-3-large
+  docs_embedding_model: text-embedding-3-large
+llm_triage:
+  enabled: true
+  model: gpt-5.5
+  reasoning_effort: high
+  batch_size: 7
+  output_file: results/triage.json
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    runtime = load_runtime_config(config_path)
+
+    assert runtime["llm_triage_enabled"] is True
+    assert runtime["llm_triage_model"] == "gpt-5.5"
+    assert runtime["llm_triage_reasoning_effort"] == "high"
+    assert runtime["llm_triage_batch_size"] == 7
+    assert runtime["llm_triage_output_file"] == "results/triage.json"
+
+
 def test_load_runtime_config_accepts_query_reasoning_level_alias(tmp_path, monkeypatch):
     config_path = tmp_path / "metis.yaml"
     config_path.write_text(

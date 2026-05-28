@@ -11,6 +11,56 @@ from metis.cli import entry
 from metis.cli import command_registry
 
 
+def test_apply_llm_triage_config_enables_and_populates_defaults():
+    args = SimpleNamespace(
+        llm_triage=False,
+        llm_triage_model=None,
+        llm_triage_reasoning_effort=None,
+        llm_triage_batch_size=None,
+        llm_triage_output_file=None,
+    )
+    runtime = {
+        "llm_triage_enabled": True,
+        "llm_triage_model": "gpt-5.5",
+        "llm_triage_reasoning_effort": "high",
+        "llm_triage_batch_size": 7,
+        "llm_triage_output_file": "results/triage.json",
+    }
+
+    entry.apply_llm_triage_config(args, runtime)
+
+    assert args.llm_triage is True
+    assert args.llm_triage_model == "gpt-5.5"
+    assert args.llm_triage_reasoning_effort == "high"
+    assert args.llm_triage_batch_size == 7
+    assert args.llm_triage_output_file == "results/triage.json"
+
+
+def test_apply_llm_triage_config_preserves_cli_values():
+    args = SimpleNamespace(
+        llm_triage=True,
+        llm_triage_model="cli-model",
+        llm_triage_reasoning_effort="low",
+        llm_triage_batch_size=3,
+        llm_triage_output_file="cli.json",
+    )
+    runtime = {
+        "llm_triage_enabled": True,
+        "llm_triage_model": "gpt-5.5",
+        "llm_triage_reasoning_effort": "high",
+        "llm_triage_batch_size": 7,
+        "llm_triage_output_file": "results/triage.json",
+    }
+
+    entry.apply_llm_triage_config(args, runtime)
+
+    assert args.llm_triage is True
+    assert args.llm_triage_model == "cli-model"
+    assert args.llm_triage_reasoning_effort == "low"
+    assert args.llm_triage_batch_size == 3
+    assert args.llm_triage_output_file == "cli.json"
+
+
 @pytest.mark.parametrize(
     "cmd", ["review_file", "review_code", "review_patch", "triage"]
 )
