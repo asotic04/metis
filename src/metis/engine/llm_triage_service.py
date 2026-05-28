@@ -214,6 +214,7 @@ class LlmTriageService:
         decisions_by_id: dict[str, dict[str, Any]] = {}
         additional_findings: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        omitted_after_retry = 0
 
         if progress_callback:
             progress_callback(
@@ -236,6 +237,7 @@ class LlmTriageService:
                         "findings": len(batch),
                     }
                 )
+            prompt_succeeded = False
             try:
                 raw = _invoke_triage_prompt(
                     self._llm_provider,
@@ -250,6 +252,7 @@ class LlmTriageService:
                 )
                 decisions, additions = _parse_triage_response(raw, batch)
                 additional_findings.extend(additions)
+                prompt_succeeded = True
             except Exception as exc:  # pragma: no cover
                 errors.append(
                     {
@@ -266,13 +269,52 @@ class LlmTriageService:
                     for finding in batch
                 }
 
+            if prompt_succeeded:
+                omitted = [finding for finding in batch if finding.id not in decisions]
+                if omitted:
+                    retry_batch_size = _omitted_retry_batch_size(batch_size)
+                    for retry_batch in _chunk_findings(omitted, retry_batch_size):
+                        retry_ids = [finding.id for finding in retry_batch]
+                        try:
+                            raw = _invoke_triage_prompt(
+                                self._llm_provider,
+                                self._usage_runtime,
+                                model=model,
+                                max_tokens=max_tokens,
+                                variables={
+                                    "batch_json": json.dumps(
+                                        _batch_payload(retry_batch), indent=2
+                                    )
+                                },
+                                reasoning_effort=reasoning_effort,
+                                temperature=0.0,
+                            )
+                            retry_decisions, retry_additions = _parse_triage_response(
+                                raw, retry_batch
+                            )
+                            decisions.update(retry_decisions)
+                            additional_findings.extend(retry_additions)
+                        except Exception as exc:  # pragma: no cover
+                            errors.append(
+                                {
+                                    "batch": batch_index,
+                                    "phase": "omitted_retry",
+                                    "ids": retry_ids,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                }
+                            )
+
+                    still_omitted = [
+                        finding for finding in batch if finding.id not in decisions
+                    ]
+                    omitted_after_retry += len(still_omitted)
+                    for finding in still_omitted:
+                        decisions[finding.id] = _omitted_decision(finding.id)
+
             for finding in batch:
                 decisions_by_id[finding.id] = decisions.get(
                     finding.id,
-                    _fallback_decision(
-                        finding.id,
-                        "LLM triage omitted this finding; kept conservatively as p4.",
-                    ),
+                    _omitted_decision(finding.id),
                 )
 
             if progress_callback:
@@ -299,6 +341,7 @@ class LlmTriageService:
             reasoning_effort=reasoning_effort,
             batch_size=batch_size,
             errors=errors,
+            omitted_after_retry=omitted_after_retry,
         )
         if progress_callback:
             summary = payload["summary"]
@@ -439,6 +482,7 @@ class LlmTriageService:
         reasoning_effort: str,
         batch_size: int,
         errors: list[dict[str, Any]],
+        omitted_after_retry: int = 0,
     ) -> dict[str, Any]:
         kept = []
         filtered = []
@@ -446,9 +490,7 @@ class LlmTriageService:
         seen_duplicate_keys: set[tuple[Any, ...]] = set()
 
         for finding in findings:
-            decision = decisions_by_id.get(
-                finding.id, _fallback_decision(finding.id, "")
-            )
+            decision = decisions_by_id.get(finding.id, _omitted_decision(finding.id))
             priority = _normalize_priority(decision.get("priority"))
             keep = bool(decision.get("keep", priority != "p5"))
             duplicate_of = _clean_optional_text(decision.get("duplicate_of"))
@@ -553,6 +595,7 @@ class LlmTriageService:
                 "kept_input_findings": kept_input_findings,
                 "filtered_findings": filtered_findings,
                 "additional_findings": kept_additional_findings,
+                "omitted_findings": omitted_after_retry,
                 "errors": errors,
             },
             "issues": kept,
@@ -700,6 +743,35 @@ def _fallback_decision(finding_id: str, reason: str) -> dict[str, Any]:
         "reason": reason,
         "exploitability": "Not assessed by LLM triage.",
     }
+
+
+def _omitted_decision(finding_id: str) -> dict[str, Any]:
+    return {
+        "id": finding_id,
+        "priority": "p5",
+        "keep": False,
+        "duplicate_of": None,
+        "reason": (
+            "LLM triage did not return a decision for this finding after retry; "
+            "filtered because no positive triage decision was returned."
+        ),
+        "exploitability": "Not assessed by LLM triage.",
+        "omitted": True,
+    }
+
+
+def _omitted_retry_batch_size(batch_size: int) -> int:
+    return max(1, min(5, (max(1, int(batch_size)) + 1) // 2))
+
+
+def _chunk_findings(
+    findings: list[_FindingRecord],
+    batch_size: int,
+) -> list[list[_FindingRecord]]:
+    return [
+        findings[index : index + batch_size]
+        for index in range(0, len(findings), batch_size)
+    ]
 
 
 def _similarity_batches(
@@ -952,7 +1024,7 @@ def _filtered_duplicate_cluster_representative(
     decisions_by_id: dict[str, dict[str, Any]],
 ) -> tuple[_FindingRecord, str] | None:
     clusters: dict[tuple[Any, ...], list[_FindingRecord]] = {}
-    strong_findings: list[_FindingRecord] = []
+    cluster_has_duplicate_signal: dict[tuple[Any, ...], bool] = {}
     for finding in findings:
         decision = decisions_by_id.get(finding.id, {})
         priority = _normalize_priority(decision.get("priority"))
@@ -961,6 +1033,8 @@ def _filtered_duplicate_cluster_representative(
             decision.get("duplicate_of")
         ):
             return None
+        if decision.get("omitted"):
+            continue
 
         family = _issue_family(finding.issue)
         if family not in _SECURITY_FAMILIES_FOR_CLUSTER_RESCUE:
@@ -976,8 +1050,19 @@ def _filtered_duplicate_cluster_representative(
             family,
         )
         clusters.setdefault(key, []).append(finding)
+        reason = str(decision.get("reason") or "").lower()
+        duplicate_signal = bool(_clean_optional_text(decision.get("duplicate_of"))) or (
+            "duplicate" in reason
+        )
+        cluster_has_duplicate_signal[key] = (
+            cluster_has_duplicate_signal.get(key, False) or duplicate_signal
+        )
 
-    duplicate_clusters = [cluster for cluster in clusters.values() if len(cluster) >= 2]
+    duplicate_clusters = [
+        cluster
+        for key, cluster in clusters.items()
+        if len(cluster) >= 2 and cluster_has_duplicate_signal.get(key, False)
+    ]
     if duplicate_clusters:
         best_cluster = max(
             duplicate_clusters,
@@ -988,10 +1073,7 @@ def _filtered_duplicate_cluster_representative(
         representative = max(best_cluster, key=_finding_strength_key)
         return representative, _conservative_rescue_priority(representative)
 
-    if not strong_findings:
-        return None
-    representative = max(strong_findings, key=_finding_strength_key)
-    return representative, _conservative_rescue_priority(representative)
+    return None
 
 
 def _is_strong_security_finding(finding: _FindingRecord) -> bool:
