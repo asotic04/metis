@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,6 +22,8 @@ DEFAULT_LLM_TRIAGE_REASONING_EFFORT = "high"
 DEFAULT_LLM_TRIAGE_BATCH_SIZE = 10
 DEFAULT_LLM_TRIAGE_MAX_TOKENS = 12000
 DEFAULT_LLM_TRIAGE_MAX_SEARCH_MATCHES = 24
+DEFAULT_LLM_TRIAGE_MAX_ATTEMPTS = 3
+DEFAULT_LLM_TRIAGE_RETRY_BASE_DELAY_SECONDS = 1.5
 
 _PRIORITY_RANK = {"p0": 0, "p1": 1, "p2": 2, "p3": 3, "p4": 4, "p5": 5}
 _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -194,10 +197,32 @@ class LlmTriageService:
         max_tokens: int = DEFAULT_LLM_TRIAGE_MAX_TOKENS,
         progress_callback=None,
     ) -> dict[str, Any]:
-        findings = self._flatten_findings(results)
         model = model or DEFAULT_LLM_TRIAGE_MODEL
         reasoning_effort = reasoning_effort or DEFAULT_LLM_TRIAGE_REASONING_EFFORT
-        batch_size = max(1, int(batch_size or DEFAULT_LLM_TRIAGE_BATCH_SIZE))
+        try:
+            batch_size = max(1, int(batch_size or DEFAULT_LLM_TRIAGE_BATCH_SIZE))
+        except Exception as exc:
+            batch_size = DEFAULT_LLM_TRIAGE_BATCH_SIZE
+            return _failure_payload_from_results(
+                results,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                batch_size=batch_size,
+                phase="configure",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+        try:
+            findings = self._flatten_findings(results)
+        except Exception as exc:
+            return _failure_payload_from_results(
+                results,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                batch_size=batch_size,
+                phase="flatten_findings",
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
         if not findings:
             return self._build_payload(
@@ -210,62 +235,82 @@ class LlmTriageService:
                 errors=[],
             )
 
-        batches = _similarity_batches(findings, batch_size)
+        try:
+            batches = _similarity_batches(findings, batch_size)
+        except Exception as exc:
+            return _failure_payload_from_findings(
+                findings,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                batch_size=batch_size,
+                phase="similarity_batches",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
         decisions_by_id: dict[str, dict[str, Any]] = {}
         additional_findings: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         omitted_after_retry = 0
 
-        if progress_callback:
-            progress_callback(
-                {
-                    "event": "llm_triage_start",
-                    "findings": len(findings),
-                    "batches": len(batches),
-                    "batch_size": batch_size,
-                }
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "llm_triage_start",
+                "findings": len(findings),
+                "batches": len(batches),
+                "batch_size": batch_size,
+            },
+            errors,
+        )
+
+        def _invoke_batch(batch_records: list[_FindingRecord]) -> str:
+            return _invoke_triage_prompt_with_retries(
+                self._llm_provider,
+                self._usage_runtime,
+                model=model,
+                max_tokens=max_tokens,
+                variables={
+                    "batch_json": json.dumps(_batch_payload(batch_records), indent=2)
+                },
+                reasoning_effort=reasoning_effort,
+                temperature=0.0,
             )
 
         for batch_index, batch in enumerate(batches, start=1):
             batch_ids = [finding.id for finding in batch]
-            if progress_callback:
-                progress_callback(
-                    {
-                        "event": "llm_triage_batch_start",
-                        "batch": batch_index,
-                        "batches": len(batches),
-                        "findings": len(batch),
-                    }
-                )
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "llm_triage_batch_start",
+                    "batch": batch_index,
+                    "batches": len(batches),
+                    "findings": len(batch),
+                },
+                errors,
+            )
             prompt_succeeded = False
             try:
-                raw = _invoke_triage_prompt(
-                    self._llm_provider,
-                    self._usage_runtime,
-                    model=model,
-                    max_tokens=max_tokens,
-                    variables={
-                        "batch_json": json.dumps(_batch_payload(batch), indent=2)
-                    },
-                    reasoning_effort=reasoning_effort,
-                    temperature=0.0,
-                )
+                raw = _invoke_batch(batch)
                 decisions, additions = _parse_triage_response(raw, batch)
                 additional_findings.extend(additions)
                 prompt_succeeded = True
             except Exception as exc:  # pragma: no cover
+                phase, attempts = _exception_phase_and_attempts(exc, "batch_invoke")
+                error = f"{type(exc).__name__}: {exc}"
                 errors.append(
                     {
                         "batch": batch_index,
+                        "phase": phase,
                         "ids": batch_ids,
-                        "error": f"{type(exc).__name__}: {exc}",
+                        "attempts": attempts,
+                        "error": error,
                     }
                 )
                 decisions = {
-                    finding.id: _triage_failed_decision(
+                    finding.id: _failure_decision(
                         finding.id,
-                        "LLM triage failed for this batch; filtered because no "
-                        "positive triage decision was available.",
+                        phase=phase,
+                        error=error,
                     )
                     for finding in batch
                 }
@@ -277,33 +322,32 @@ class LlmTriageService:
                     for retry_batch in _chunk_findings(omitted, retry_batch_size):
                         retry_ids = [finding.id for finding in retry_batch]
                         try:
-                            raw = _invoke_triage_prompt(
-                                self._llm_provider,
-                                self._usage_runtime,
-                                model=model,
-                                max_tokens=max_tokens,
-                                variables={
-                                    "batch_json": json.dumps(
-                                        _batch_payload(retry_batch), indent=2
-                                    )
-                                },
-                                reasoning_effort=reasoning_effort,
-                                temperature=0.0,
-                            )
+                            raw = _invoke_batch(retry_batch)
                             retry_decisions, retry_additions = _parse_triage_response(
                                 raw, retry_batch
                             )
                             decisions.update(retry_decisions)
                             additional_findings.extend(retry_additions)
                         except Exception as exc:  # pragma: no cover
+                            phase, attempts = _exception_phase_and_attempts(
+                                exc, "omitted_retry_invoke"
+                            )
+                            error = f"{type(exc).__name__}: {exc}"
                             errors.append(
                                 {
                                     "batch": batch_index,
-                                    "phase": "omitted_retry",
+                                    "phase": phase,
                                     "ids": retry_ids,
-                                    "error": f"{type(exc).__name__}: {exc}",
+                                    "attempts": attempts,
+                                    "error": error,
                                 }
                             )
+                            for finding in retry_batch:
+                                decisions[finding.id] = _failure_decision(
+                                    finding.id,
+                                    phase=phase,
+                                    error=error,
+                                )
 
                     still_omitted = [
                         finding for finding in batch if finding.id not in decisions
@@ -318,43 +362,55 @@ class LlmTriageService:
                     _omitted_decision(finding.id),
                 )
 
-            if progress_callback:
-                kept = sum(
-                    1
-                    for decision in decisions.values()
-                    if _normalize_priority(decision.get("priority")) != "p5"
-                    and bool(decision.get("keep", True))
-                )
-                progress_callback(
-                    {
-                        "event": "llm_triage_batch_done",
-                        "batch": batch_index,
-                        "batches": len(batches),
-                        "kept": kept,
-                    }
-                )
-
-        payload = self._build_payload(
-            findings,
-            decisions_by_id,
-            additional_findings,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            batch_size=batch_size,
-            errors=errors,
-            omitted_after_retry=omitted_after_retry,
-        )
-        if progress_callback:
-            summary = payload["summary"]
-            progress_callback(
-                {
-                    "event": "llm_triage_done",
-                    "findings": summary["total_input_findings"],
-                    "kept": summary["kept_findings"],
-                    "filtered": summary["filtered_findings"],
-                    "additional": summary["additional_findings"],
-                }
+            kept = sum(
+                1
+                for decision in decisions.values()
+                if _normalize_priority(decision.get("priority")) != "p5"
+                and bool(decision.get("keep", True))
             )
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "llm_triage_batch_done",
+                    "batch": batch_index,
+                    "batches": len(batches),
+                    "kept": kept,
+                },
+                errors,
+            )
+
+        try:
+            payload = self._build_payload(
+                findings,
+                decisions_by_id,
+                additional_findings,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                batch_size=batch_size,
+                errors=errors,
+                omitted_after_retry=omitted_after_retry,
+            )
+        except Exception as exc:
+            return _failure_payload_from_findings(
+                findings,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                batch_size=batch_size,
+                phase="build_payload",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+        _emit_progress(
+            progress_callback,
+            {
+                "event": "llm_triage_done",
+                "findings": payload["summary"]["total_input_findings"],
+                "kept": payload["summary"]["kept_findings"],
+                "filtered": payload["summary"]["filtered_findings"],
+                "additional": payload["summary"]["additional_findings"],
+            },
+            errors,
+        )
         return payload
 
     def _flatten_findings(self, results: dict[str, Any]) -> list[_FindingRecord]:
@@ -629,6 +685,52 @@ def _batch_payload(batch: list[_FindingRecord]) -> list[dict[str, Any]]:
     return payload
 
 
+class _TriagePromptRetriesExhausted(RuntimeError):
+    def __init__(self, attempt_errors: list[dict[str, Any]]):
+        self.attempt_errors = attempt_errors
+        last = attempt_errors[-1]["error"] if attempt_errors else "unknown error"
+        super().__init__(
+            f"LLM triage prompt failed after {len(attempt_errors)} attempt(s): {last}"
+        )
+
+
+def _invoke_triage_prompt_with_retries(
+    llm_provider,
+    usage_runtime,
+    *,
+    model: str,
+    max_tokens: int,
+    variables: dict[str, Any],
+    reasoning_effort: str | None = None,
+    temperature: float = 0.0,
+    max_attempts: int = DEFAULT_LLM_TRIAGE_MAX_ATTEMPTS,
+) -> str:
+    max_attempts = max(1, int(max_attempts or 1))
+    attempt_errors: list[dict[str, Any]] = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return _invoke_triage_prompt(
+                llm_provider,
+                usage_runtime,
+                model=model,
+                max_tokens=max_tokens,
+                variables=variables,
+                reasoning_effort=reasoning_effort,
+                temperature=temperature,
+            )
+        except Exception as exc:
+            attempt_errors.append(
+                {
+                    "attempt": attempt,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            if attempt >= max_attempts:
+                raise _TriagePromptRetriesExhausted(attempt_errors) from exc
+            _triage_retry_sleep(_triage_retry_delay_seconds(attempt))
+    raise _TriagePromptRetriesExhausted(attempt_errors)
+
+
 def _invoke_triage_prompt(
     llm_provider,
     usage_runtime,
@@ -652,6 +754,37 @@ def _invoke_triage_prompt(
         [("system", _TRIAGE_SYSTEM_PROMPT), ("user", _TRIAGE_USER_PROMPT)]
     )
     return (prompt | chat | StrOutputParser()).invoke(variables).strip()
+
+
+def _triage_retry_delay_seconds(attempt: int) -> float:
+    return min(8.0, DEFAULT_LLM_TRIAGE_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
+
+
+def _triage_retry_sleep(delay_seconds: float) -> None:
+    time.sleep(max(0.0, float(delay_seconds or 0.0)))
+
+
+def _exception_phase_and_attempts(
+    exc: Exception, default_phase: str
+) -> tuple[str, list[dict[str, Any]]]:
+    if isinstance(exc, _TriagePromptRetriesExhausted):
+        return default_phase, list(exc.attempt_errors)
+    return default_phase, []
+
+
+def _emit_progress(callback, event: dict[str, Any], errors: list[dict[str, Any]]) -> None:
+    if callback is None:
+        return
+    try:
+        callback(event)
+    except Exception as exc:
+        errors.append(
+            {
+                "phase": "progress_callback",
+                "event": str(event.get("event") or ""),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
 
 
 def _triage_chat_model_kwargs(usage_runtime, *, reasoning_effort=None) -> dict[str, Any]:
@@ -735,14 +868,24 @@ def _parse_additional_findings(raw_items) -> list[dict[str, Any]]:
     return additions
 
 
-def _triage_failed_decision(finding_id: str, reason: str) -> dict[str, Any]:
+def _failure_decision(
+    finding_id: str,
+    *,
+    phase: str,
+    error: str,
+) -> dict[str, Any]:
     return {
         "id": finding_id,
         "priority": "p5",
         "keep": False,
         "duplicate_of": None,
-        "reason": reason,
-        "exploitability": "Not assessed by LLM triage.",
+        "reason": (
+            f"LLM triage failed during {phase}; filtered because triage was "
+            "requested and no positive triage decision was available."
+        ),
+        "exploitability": "Not assessed because LLM triage failed.",
+        "phase": phase,
+        "error": error,
     }
 
 
@@ -860,6 +1003,12 @@ def _triaged_issue(
         decision.get("exploitability") or ""
     ).strip()
     item["llm_triage_duplicate_of"] = _clean_optional_text(decision.get("duplicate_of"))
+    phase = str(decision.get("phase") or "").strip()
+    if phase:
+        item["llm_triage_failure_phase"] = phase
+    error = str(decision.get("error") or "").strip()
+    if error:
+        item["llm_triage_error"] = error
     return item
 
 
@@ -872,6 +1021,118 @@ def _filtered_triage_issue(
     item["llm_triage_filtered"] = True
     item["llm_triage_keep"] = False
     return item
+
+
+def _failure_payload_from_findings(
+    findings: list[_FindingRecord],
+    *,
+    model: str,
+    reasoning_effort: str,
+    batch_size: int,
+    phase: str,
+    error: str,
+) -> dict[str, Any]:
+    filtered = [
+        _filtered_triage_issue(
+            finding,
+            _failure_decision(finding.id, phase=phase, error=error),
+            "p5",
+        )
+        for finding in findings
+    ]
+    return _failure_payload(
+        filtered,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        batch_size=batch_size,
+        phase=phase,
+        error=error,
+    )
+
+
+def _failure_payload_from_results(
+    results: dict[str, Any],
+    *,
+    model: str,
+    reasoning_effort: str,
+    batch_size: int,
+    phase: str,
+    error: str,
+) -> dict[str, Any]:
+    filtered = []
+    reviews = results.get("reviews") if isinstance(results, dict) else None
+    next_id = 1
+    if isinstance(reviews, list):
+        for file_entry in reviews:
+            if not isinstance(file_entry, dict):
+                continue
+            file_name = str(file_entry.get("file") or "")
+            file_path = str(file_entry.get("file_path") or "")
+            issues = file_entry.get("reviews")
+            if not isinstance(issues, list):
+                continue
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                issue_copy = copy.deepcopy(issue)
+                issue_copy["id"] = f"F{next_id:03d}"
+                issue_copy["priority"] = "p5"
+                issue_copy["file"] = str(
+                    issue_copy.get("file")
+                    or issue_copy.get("primary_file")
+                    or file_name
+                )
+                issue_copy["file_path"] = str(issue_copy.get("file_path") or file_path)
+                issue_copy["llm_triage_reason"] = (
+                    f"LLM triage failed during {phase}; filtered because triage "
+                    "was requested and no positive triage decision was available."
+                )
+                issue_copy["llm_triage_exploitability"] = (
+                    "Not assessed because LLM triage failed."
+                )
+                issue_copy["llm_triage_duplicate_of"] = None
+                issue_copy["llm_triage_failure_phase"] = phase
+                issue_copy["llm_triage_error"] = error
+                issue_copy["llm_triage_filtered"] = True
+                issue_copy["llm_triage_keep"] = False
+                filtered.append(issue_copy)
+                next_id += 1
+    return _failure_payload(
+        filtered,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        batch_size=batch_size,
+        phase=phase,
+        error=error,
+    )
+
+
+def _failure_payload(
+    filtered_issues: list[dict[str, Any]],
+    *,
+    model: str,
+    reasoning_effort: str,
+    batch_size: int,
+    phase: str,
+    error: str,
+) -> dict[str, Any]:
+    return {
+        "summary": {
+            "schema_version": 1,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "batch_size": batch_size,
+            "total_input_findings": len(filtered_issues),
+            "kept_findings": 0,
+            "kept_input_findings": 0,
+            "filtered_findings": len(filtered_issues),
+            "additional_findings": 0,
+            "omitted_findings": 0,
+            "errors": [{"phase": phase, "error": error}],
+        },
+        "issues": [],
+        "filtered_issues": filtered_issues,
+    }
 
 
 def _additional_issue(
