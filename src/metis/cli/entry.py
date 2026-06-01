@@ -86,7 +86,25 @@ def resolve_custom_prompt(args):
     return custom_prompt_text
 
 
+def resolve_threat_model(args, runtime):
+    configured_text = runtime.get("threat_model_text")
+    if not getattr(args, "threat_model", None):
+        return configured_text
+
+    threat_model_path = Path(args.threat_model)
+    if threat_model_path.is_file():
+        return read_file_content(str(threat_model_path))
+
+    print_console(
+        f"[yellow]Warning:[/yellow] Ignoring --threat-model '{escape(str(threat_model_path))}'. File does not exist.",
+        args.quiet,
+    )
+    return configured_text
+
+
 def build_engine(args, runtime):
+    runtime = dict(runtime)
+    runtime["threat_model_text"] = resolve_threat_model(args, runtime)
     llm_provider_name = runtime.get("llm_provider_name", "openai")
     provider_cls = get_provider(llm_provider_name)
     llm_provider = provider_cls(runtime)
@@ -351,6 +369,11 @@ def main():
         "--custom-prompt",
         type=str,
         help="Path to a custom prompt file (.md or .txt) used to guide analysis",
+    )
+    parser.add_argument(
+        "--threat-model",
+        type=str,
+        help="Path to a threat model document used to scope review and LLM triage",
     )
     parser.add_argument("--version", action="store_true", help="Show program version")
     parser.add_argument(

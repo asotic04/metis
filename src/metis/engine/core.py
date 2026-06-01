@@ -72,12 +72,15 @@ class MetisEngine:
             kwargs.get("triage_tool_timeout_seconds", 12)
         )
         self.custom_prompt_text = kwargs.get("custom_prompt_text")
+        self.threat_model_text = kwargs.get("threat_model_text")
+        self.threat_model_keywords = list(kwargs.get("threat_model_keywords") or [])
         self.metisignore_file = kwargs.get("metisignore_file") or ".metisignore"
         self.review_code_include_paths = kwargs.get("review_code_include_paths", [])
         self.review_code_exclude_paths = kwargs.get("review_code_exclude_paths", [])
         self.reachability_settings = coerce_reachability_settings(
             kwargs, default_workers=self.max_workers
         )
+        self._add_threat_model_to_reachability_settings()
 
         self.plugin_config = load_plugin_config()
         self.custom_guidance_precedence = self.plugin_config.get(
@@ -106,6 +109,8 @@ class MetisEngine:
             usage_runtime=self.usage_runtime,
             plugin_config=self.plugin_config,
             custom_prompt_text=self.custom_prompt_text,
+            threat_model_text=self.threat_model_text,
+            threat_model_keywords=self.threat_model_keywords,
             custom_guidance_precedence=self.custom_guidance_precedence,
             embed_model_code=self.get_embed_model_code(),
             embed_model_docs=self.get_embed_model_docs(),
@@ -148,11 +153,30 @@ class MetisEngine:
             codebase_path=self.codebase_path,
             llm_provider=self.llm_provider,
             usage_runtime=self.usage_runtime,
+            threat_model_text=self.threat_model_text,
         )
         self._triage_service = self._build_triage_service()
 
     def _init_usage_runtime(self, kwargs) -> UsageRuntime:
         return kwargs.get("usage_runtime") or UsageRuntime(self.codebase_path)
+
+    def _add_threat_model_to_reachability_settings(self) -> None:
+        if not self.threat_model_text:
+            return
+        domain_hints = list(self.reachability_settings.get("domain_hints") or [])
+        hint = {
+            "notes": [
+                (
+                    "Threat model guidance applies to this review. Treat named "
+                    "attacker capabilities, APIs, data flows, and vulnerability "
+                    "classes as in-scope security concerns:\n"
+                    f"{self.threat_model_text}"
+                )
+            ],
+            "keywords": list(self.threat_model_keywords),
+        }
+        domain_hints.append(hint)
+        self.reachability_settings["domain_hints"] = domain_hints
 
     def _attach_embed_models_to_backend(self) -> None:
         if hasattr(self.vector_backend, "embed_model_code"):
@@ -243,6 +267,7 @@ class MetisEngine:
                 llm_provider=self.llm_provider,
                 plugin_config=self.plugin_config,
                 custom_prompt_text=self.custom_prompt_text,
+                threat_model_text=self.threat_model_text,
                 custom_guidance_precedence=self.custom_guidance_precedence,
                 llama_query_model=self.llama_query_model,
                 max_token_length=self.max_token_length,

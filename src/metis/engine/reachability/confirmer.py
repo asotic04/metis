@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from metis.reachability_settings import DEFAULT_REACHABILITY_WORKERS
 from metis.usage import submit_with_current_context
+from metis.engine.helpers import apply_threat_model_guidance
 
 from .finding_normalization import (
     _finding_from_llm_entry,
@@ -144,6 +145,7 @@ class VulnerabilityConfirmer:
         codebase_path,
         max_tokens=4096,
         reasoning_effort=None,
+        threat_model_text=None,
     ):
         self._p = llm_provider
         self._m = model
@@ -151,6 +153,10 @@ class VulnerabilityConfirmer:
         self._cb = os.path.abspath(codebase_path)
         self._t = max_tokens
         self._reasoning_effort = reasoning_effort
+        self._threat_model_text = threat_model_text
+
+    def _with_threat_model(self, prompt: str) -> str:
+        return apply_threat_model_guidance(prompt, self._threat_model_text)
 
     def _path_nodes(self, batch, graph):
         nodes = {}
@@ -264,7 +270,7 @@ class VulnerabilityConfirmer:
             self._u,
             model=self._m,
             max_tokens=self._t,
-            system_prompt=_CONFIRM_SYS,
+            system_prompt=self._with_threat_model(_CONFIRM_SYS),
             user_prompt=_CONFIRM_USR,
             variables={
                 "paths_section": self._paths_section(
@@ -350,7 +356,7 @@ class VulnerabilityConfirmer:
             self._u,
             model=self._m,
             max_tokens=self._t,
-            system_prompt=_FILE_CONFIRM_SYS,
+            system_prompt=self._with_threat_model(_FILE_CONFIRM_SYS),
             user_prompt=_FILE_CONFIRM_USR,
             variables={
                 "target_file": target_file,

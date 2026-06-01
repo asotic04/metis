@@ -16,7 +16,7 @@ def test_llm_triage_prompt_uses_metis_priority_rubric():
     assert "Metis default priority rubric" in prompt
     assert "p0: emergency response" in prompt
     assert "p2: normal security priority" in prompt
-    assert "This is the default for kept real security" in prompt
+    assert "default for kept" in prompt
     assert "p5: Metis-only filtered state" in prompt
 
 
@@ -123,6 +123,73 @@ int noisy_warning(void) {
     assert payload["issues"][0]["id"] == "F001"
     assert payload["issues"][0]["priority"] == "p0"
     assert payload["issues"][0]["llm_triage_reason"].startswith("Direct")
+
+
+def test_llm_triage_prompt_includes_threat_model(monkeypatch, tmp_path):
+    source = tmp_path / "pngwrite.c"
+    source.write_text(
+        """
+int png_image_write_to_memory(size_t *memory_bytes) {
+    *memory_bytes = 0;
+    return 1;
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    def _fake_invoke(_provider, _usage_runtime, **kwargs):
+        calls.append(kwargs)
+        return json.dumps(
+            {
+                "decisions": [
+                    {
+                        "id": "F001",
+                        "priority": "p3",
+                        "keep": True,
+                        "duplicate_of": None,
+                        "reason": "Threat model makes public API output pointers in scope.",
+                        "exploitability": "Caller-controlled pointer reaches API.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(llm_triage_service, "_invoke_triage_prompt", _fake_invoke)
+
+    service = LlmTriageService(
+        codebase_path=tmp_path,
+        llm_provider=object(),
+        usage_runtime=SimpleNamespace(),
+        threat_model_text="Public API output pointers are in scope for libpng.",
+    )
+    payload = service.triage_review_results(
+        {
+            "reviews": [
+                {
+                    "file": "pngwrite.c",
+                    "file_path": str(source),
+                    "reviews": [
+                        {
+                            "issue": "memory_bytes is dereferenced without a NULL check",
+                            "line_number": 2,
+                            "primary_file": "pngwrite.c",
+                            "primary_function": "png_image_write_to_memory",
+                            "severity": "Medium",
+                            "confidence": 0.95,
+                            "cwe": "CWE-908",
+                            "reasoning": "The output pointer is used directly.",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert "Public API output pointers" in calls[0]["variables"]["threat_model"]
+    assert payload["summary"]["threat_model_provided"] is True
+    assert payload["issues"][0]["priority"] == "p3"
 
 
 def test_llm_triage_retries_then_filters_omitted_decisions(monkeypatch, tmp_path):

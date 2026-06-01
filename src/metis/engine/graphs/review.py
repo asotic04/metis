@@ -121,6 +121,7 @@ def review_node_build_prompt(
     custom_guidance_precedence: str,
     schema_prompt_section: str,
     hardware_cwe_guidance: str = "",
+    threat_model_text: str | None = None,
 ) -> ReviewState:
     include_relevant_context = bool(state.get("use_retrieval_context", True))
     system = build_review_system_prompt(
@@ -132,6 +133,7 @@ def review_node_build_prompt(
         schema_prompt_section,
         hardware_cwe_guidance,
         include_relevant_context=include_relevant_context,
+        threat_model_text=threat_model_text,
     )
     new_state: ReviewState = dict(state)
     new_state["system_prompt"] = system
@@ -190,10 +192,12 @@ class ReviewGraph:
         llama_query_model,
         max_token_length,
         chat_model_kwargs: dict[str, Any] | None = None,
+        threat_model_text: str | None = None,
     ):
         self.llm_provider = llm_provider
         self.plugin_config = plugin_config
         self.custom_prompt_text = custom_prompt_text
+        self.threat_model_text = threat_model_text
         self.custom_guidance_precedence = custom_guidance_precedence or ""
         self.llama_query_model = llama_query_model
         self.max_token_length = max_token_length
@@ -258,6 +262,7 @@ class ReviewGraph:
             default_prompt_key=default_prompt_key,
             report_prompt=self.report_prompt,
             custom_prompt_text=self.custom_prompt_text,
+            threat_model_text=self.threat_model_text,
             custom_guidance_precedence=self.custom_guidance_precedence,
             schema_prompt_section=self._schema_prompt_section,
             hardware_cwe_guidance=self.hardware_cwe_guidance,

@@ -77,6 +77,7 @@ Options:
     --backend chroma|postgres  Vector backend to use (default: chroma).
     --output-file PATH         Save analysis results to this file.
     --custom-prompt PATH       Custom prompt file (.md or .txt) to guide analysis.
+    --threat-model PATH        Threat model document to scope review and LLM triage.
     --triage                   Triage findings and annotate SARIF output for review commands.
     --include-triaged          Include findings already triaged by Metis.
     --llm-triage               Run reasoning-model triage after review_file or review_code.

@@ -110,6 +110,7 @@ class TreeSitterReachabilityService:
             self._usage_runtime,
             self._config.codebase_path,
             reasoning_effort=reasoning_effort,
+            threat_model_text=self._config.threat_model_text,
         )
 
         path_findings = []
