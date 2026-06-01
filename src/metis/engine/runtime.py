@@ -18,6 +18,8 @@ class EngineConfig:
     usage_runtime: UsageRuntime
     plugin_config: dict[str, Any]
     custom_prompt_text: str | None
+    threat_model_text: str | None
+    threat_model_keywords: list[str]
     custom_guidance_precedence: str
     embed_model_code: Any
     embed_model_docs: Any

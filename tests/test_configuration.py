@@ -79,6 +79,64 @@ llm_triage:
     assert runtime["llm_triage_output_file"] == "results/triage.json"
 
 
+def test_load_runtime_config_reads_inline_threat_model(tmp_path, monkeypatch):
+    config_path = tmp_path / "metis.yaml"
+    config_path.write_text(
+        """
+llm_provider:
+  name: openai
+  model: gpt-test
+  code_embedding_model: text-embedding-3-large
+  docs_embedding_model: text-embedding-3-large
+threat_model:
+  text: |
+    Public API output pointers and filenames are attacker-influenced.
+  keywords:
+    - png_image_write_to_memory
+    - CWE-908
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    runtime = load_runtime_config(config_path)
+
+    assert "output pointers" in runtime["threat_model_text"]
+    assert runtime["threat_model_path"] == ""
+    assert runtime["threat_model_keywords"] == [
+        "png_image_write_to_memory",
+        "CWE-908",
+    ]
+
+
+def test_load_runtime_config_reads_threat_model_file(tmp_path, monkeypatch):
+    threat_model_path = tmp_path / "threat-model.md"
+    threat_model_path.write_text(
+        "Libpng simplified API caller-controlled buffers are in scope.",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / "metis.yaml"
+    threat_model_yaml_path = str(threat_model_path).replace("\\", "/")
+    config_path.write_text(
+        f"""
+llm_provider:
+  name: openai
+  model: gpt-test
+  code_embedding_model: text-embedding-3-large
+  docs_embedding_model: text-embedding-3-large
+threat_model:
+  path: '{threat_model_yaml_path}'
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    runtime = load_runtime_config(config_path)
+
+    assert "simplified API" in runtime["threat_model_text"]
+    assert runtime["threat_model_path"] == threat_model_yaml_path
+
+
 def test_load_runtime_config_accepts_query_reasoning_level_alias(tmp_path, monkeypatch):
     config_path = tmp_path / "metis.yaml"
     config_path.write_text(

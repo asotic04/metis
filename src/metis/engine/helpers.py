@@ -80,3 +80,29 @@ def apply_custom_guidance(base_prompt, custom_guidance, precedence_note):
     if precedence_note:
         return f"{precedence_note.strip()}\n\n{guidance_block}\n\n{base_prompt}"
     return f"{guidance_block}\n\n{base_prompt}"
+
+
+def format_threat_model_guidance(threat_model_text):
+    text = str(threat_model_text or "").strip()
+    if not text:
+        return ""
+    return (
+        "Project Threat Model:\n"
+        f"{text}\n\n"
+        "Threat-model handling rules:\n"
+        "- Treat this threat model as authoritative project-specific security scope.\n"
+        "- Pay special attention to issue classes, data flows, APIs, and attacker "
+        "capabilities named in the threat model.\n"
+        "- Findings inside this threat model are in scope even when they would "
+        "otherwise look like generic caller misuse, path handling, reliability, "
+        "or low-priority hardening.\n"
+        "- Still require concrete code evidence and do not invent findings not "
+        "supported by the provided code."
+    )
+
+
+def apply_threat_model_guidance(base_prompt, threat_model_text):
+    guidance = format_threat_model_guidance(threat_model_text)
+    if not guidance:
+        return base_prompt
+    return f"{guidance}\n\n{base_prompt}"

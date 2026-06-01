@@ -61,6 +61,22 @@ def test_apply_llm_triage_config_preserves_cli_values():
     assert args.llm_triage_output_file == "cli.json"
 
 
+def test_resolve_threat_model_prefers_cli_file(tmp_path):
+    threat_model_path = tmp_path / "tm.md"
+    threat_model_path.write_text("CLI threat model", encoding="utf-8")
+    args = SimpleNamespace(
+        threat_model=str(threat_model_path),
+        quiet=True,
+    )
+
+    text = entry.resolve_threat_model(
+        args,
+        {"threat_model_text": "configured threat model"},
+    )
+
+    assert text == "CLI threat model"
+
+
 @pytest.mark.parametrize(
     "cmd", ["review_file", "review_code", "review_patch", "triage"]
 )

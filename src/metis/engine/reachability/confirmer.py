@@ -6,11 +6,13 @@ import logging
 import os
 from collections import defaultdict
 
+from metis.engine.helpers import apply_threat_model_guidance
+from metis.engine.llm_runner import JsonPromptRequest, JsonPromptRunner
+
 from .finding_builder import _finding_from_llm_entry
 from .finding_identity import _same_file_ref
 from .finding_values import _safe_int
 from .graph_utils import _chunked, _dedupe_paths, _emit_progress
-from metis.engine.llm_runner import JsonPromptRequest, JsonPromptRunner
 from .llm_runner import reachability_response_payload
 from .llm_schemas import ReachabilityConfirmationResponseModel
 from .limits import CONFIRMATION_MAX_TOKENS, CONFIRMATION_PATH_BATCH_SIZE
@@ -125,11 +127,16 @@ class VulnerabilityConfirmer:
         usage_runtime,
         codebase_path,
         options,
+        threat_model_text=None,
     ):
         self._m = model
         self._cb = os.path.abspath(codebase_path)
         self._reasoning_effort = options.reasoning_effort
         self._runner = JsonPromptRunner(llm_provider, usage_runtime)
+        self._threat_model_text = threat_model_text
+
+    def _with_threat_model(self, prompt: str) -> str:
+        return apply_threat_model_guidance(prompt, self._threat_model_text)
 
     def _path_nodes(self, batch, graph):
         nodes = {}
@@ -291,7 +298,7 @@ class VulnerabilityConfirmer:
     def _confirm_batch(self, paths, graph):
         batch = list(paths)
         raw = self._invoke_confirmation(
-            system_prompt=_CONFIRM_SYS,
+            system_prompt=self._with_threat_model(_CONFIRM_SYS),
             user_prompt=_CONFIRM_USR,
             variables=self._path_confirmation_variables(batch, graph),
             label="Reachability confirmation",
@@ -382,7 +389,7 @@ class VulnerabilityConfirmer:
 
     def _confirm_file_batch(self, target_file, batch, graph):
         raw = self._invoke_confirmation(
-            system_prompt=_FILE_CONFIRM_SYS,
+            system_prompt=self._with_threat_model(_FILE_CONFIRM_SYS),
             user_prompt=_FILE_CONFIRM_USR,
             variables=self._file_confirmation_variables(target_file, batch, graph),
             label="File reachability confirmation",

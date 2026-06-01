@@ -13,6 +13,7 @@ from typing import Any
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from metis.engine.helpers import format_threat_model_guidance
 from metis.utils import parse_json_output
 
 from .reachability.source_context import _read_line_context, _read_named_function_body
@@ -86,6 +87,12 @@ Triage the supplied security review findings as exploitable vulnerability candid
 You are not the original reporter. Your job is to reduce noise and keep only the
 strongest independent security bugs. Use the code context, path context, evidence,
 severity, and reasoning. Be strict.
+
+If a project threat model is supplied, use it as authoritative project-specific
+security scope. Findings that match attacker capabilities, APIs, data flows, or
+weakness classes named in the threat model are in scope and should not be filtered
+merely because they look like generic caller misuse, path handling, reliability, or
+low-priority hardening in a generic library. Still require concrete code evidence.
 
 Metis default priority rubric:
 - p0: emergency response. Reserve this for an issue that can take down the service,
@@ -164,6 +171,8 @@ Only add additional_findings when the provided code context or repo search evide
 supports a real security issue not already represented by an input finding. Do not speculate
 from names alone.
 
+{threat_model}
+
 Batch:
 {batch_json}
 """
@@ -182,10 +191,18 @@ class _FindingRecord:
 
 
 class LlmTriageService:
-    def __init__(self, *, codebase_path, llm_provider, usage_runtime):
+    def __init__(
+        self,
+        *,
+        codebase_path,
+        llm_provider,
+        usage_runtime,
+        threat_model_text=None,
+    ):
         self._codebase_path = str(codebase_path)
         self._llm_provider = llm_provider
         self._usage_runtime = usage_runtime
+        self._threat_model_text = str(threat_model_text or "").strip()
 
     def triage_review_results(
         self,
@@ -270,7 +287,10 @@ class LlmTriageService:
                 model=model,
                 max_tokens=max_tokens,
                 variables={
-                    "batch_json": json.dumps(_batch_payload(batch_records), indent=2)
+                    "batch_json": json.dumps(_batch_payload(batch_records), indent=2),
+                    "threat_model": _triage_threat_model_prompt(
+                        self._threat_model_text
+                    ),
                 },
                 reasoning_effort=reasoning_effort,
                 temperature=0.0,
@@ -389,6 +409,7 @@ class LlmTriageService:
                 batch_size=batch_size,
                 errors=errors,
                 omitted_after_retry=omitted_after_retry,
+                threat_model_provided=bool(self._threat_model_text),
             )
         except Exception as exc:
             return _failure_payload_from_findings(
@@ -540,6 +561,7 @@ class LlmTriageService:
         batch_size: int,
         errors: list[dict[str, Any]],
         omitted_after_retry: int = 0,
+        threat_model_provided: bool = False,
     ) -> dict[str, Any]:
         kept = []
         filtered = []
@@ -653,6 +675,7 @@ class LlmTriageService:
                 "filtered_findings": filtered_findings,
                 "additional_findings": kept_additional_findings,
                 "omitted_findings": omitted_after_retry,
+                "threat_model_provided": threat_model_provided,
                 "errors": errors,
             },
             "issues": kept,
@@ -754,6 +777,13 @@ def _invoke_triage_prompt(
         [("system", _TRIAGE_SYSTEM_PROMPT), ("user", _TRIAGE_USER_PROMPT)]
     )
     return (prompt | chat | StrOutputParser()).invoke(variables).strip()
+
+
+def _triage_threat_model_prompt(threat_model_text: str | None) -> str:
+    guidance = format_threat_model_guidance(threat_model_text)
+    if not guidance:
+        return "Project threat model: none supplied."
+    return guidance
 
 
 def _triage_retry_delay_seconds(attempt: int) -> float:

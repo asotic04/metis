@@ -44,6 +44,26 @@ def test_build_review_system_prompt_replaces_placeholder():
     assert schema_section in prompt
 
 
+def test_build_review_system_prompt_includes_threat_model_guidance():
+    language_prompts = {
+        "security_review_file": "Intro [[REVIEW_SCHEMA_FIELDS]]",
+        "security_review_checks": "Checklist items.",
+    }
+    prompt = build_review_system_prompt(
+        language_prompts,
+        "security_review_file",
+        report_prompt="Reporting instructions.",
+        custom_prompt_text=None,
+        custom_guidance_precedence="",
+        schema_prompt_section='- "issue": description',
+        threat_model_text="Public API output pointers are in scope.",
+    )
+
+    assert "Project Threat Model" in prompt
+    assert "Public API output pointers are in scope." in prompt
+    assert "generic caller misuse" in prompt
+
+
 def test_build_review_system_prompt_preserves_legacy_context_prompt():
     language_prompts = {
         "security_review_file": (

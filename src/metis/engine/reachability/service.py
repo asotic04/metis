@@ -356,6 +356,7 @@ class TreeSitterReachabilityService:
             self._usage_runtime,
             self._config.codebase_path,
             options,
+            threat_model_text=self._config.threat_model_text,
         )
 
     def _normalize_target_file(self, file_path):

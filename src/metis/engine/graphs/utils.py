@@ -5,7 +5,7 @@ import logging
 import re
 from typing import Annotated, Literal, get_args, get_origin
 
-from metis.engine.helpers import apply_custom_guidance
+from metis.engine.helpers import apply_custom_guidance, apply_threat_model_guidance
 from .schemas import ReviewIssueModel
 
 logger = logging.getLogger("metis")
@@ -261,6 +261,7 @@ def build_review_system_prompt(
     schema_prompt_section,
     hardware_cwe_guidance="",
     include_relevant_context=True,
+    threat_model_text=None,
 ):
     """Compose the system prompt for a review in a single place."""
     base = (
@@ -291,6 +292,7 @@ def build_review_system_prompt(
     base = apply_custom_guidance(
         base, custom_prompt_text, custom_guidance_precedence or ""
     )
+    base = apply_threat_model_guidance(base, threat_model_text)
     if not include_relevant_context:
         return _build_review_prompt_without_context(base)
     return base

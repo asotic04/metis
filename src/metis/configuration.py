@@ -170,6 +170,54 @@ def _resolve_llm_api_key(provider_name: str, provider_config: dict) -> str:
     return ""
 
 
+def _read_optional_text_file(path: str | Path | None) -> str:
+    if not path:
+        return ""
+    candidate = Path(path).expanduser()
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Threat model file not found: {candidate}")
+    return candidate.read_text(encoding="utf-8").strip()
+
+
+def _normalize_threat_model_config(raw) -> dict[str, object]:
+    if raw is None:
+        return {"text": "", "path": "", "keywords": []}
+
+    if isinstance(raw, str):
+        return {"text": raw.strip(), "path": "", "keywords": []}
+
+    if not isinstance(raw, dict):
+        return {"text": str(raw).strip(), "path": "", "keywords": []}
+
+    if raw.get("enabled") is False:
+        return {"text": "", "path": "", "keywords": []}
+
+    text_parts = []
+    for key in ("text", "document", "guidance"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            text_parts.append(value.strip())
+
+    path = str(raw.get("path") or raw.get("file") or "").strip()
+    file_text = _read_optional_text_file(path)
+    if file_text:
+        text_parts.append(file_text)
+
+    keywords_raw = raw.get("keywords") or raw.get("terms") or []
+    if isinstance(keywords_raw, str):
+        keywords = [item.strip() for item in keywords_raw.split(",") if item.strip()]
+    elif isinstance(keywords_raw, (list, tuple, set)):
+        keywords = [str(item).strip() for item in keywords_raw if str(item).strip()]
+    else:
+        keywords = []
+
+    return {
+        "text": "\n\n".join(text_parts).strip(),
+        "path": path,
+        "keywords": keywords,
+    }
+
+
 def load_runtime_config(config_path=None, enable_psql=False):
     cfg = load_metis_config(config_path)
 
@@ -282,6 +330,11 @@ def load_runtime_config(config_path=None, enable_psql=False):
         "review_code_exclude_paths", []
     )
     runtime.update(collect_reachability_config(cfg, engine_cfg))
+
+    threat_model_cfg = _normalize_threat_model_config(cfg.get("threat_model"))
+    runtime["threat_model_text"] = threat_model_cfg["text"]
+    runtime["threat_model_path"] = threat_model_cfg["path"]
+    runtime["threat_model_keywords"] = threat_model_cfg["keywords"]
 
     llm_triage_cfg = cfg.get("llm_triage", {}) or {}
     runtime["llm_triage_enabled"] = bool(llm_triage_cfg.get("enabled", False))
