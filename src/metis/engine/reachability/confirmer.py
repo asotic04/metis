@@ -1,49 +1,36 @@
 # SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # SPDX-License-Identifier: Apache-2.0
 
-"""LLM confirmation for deterministic reachability paths."""
 
-from __future__ import annotations
 import logging
 import os
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from metis.reachability_settings import DEFAULT_REACHABILITY_WORKERS
-from metis.usage import submit_with_current_context
 from metis.engine.helpers import apply_threat_model_guidance
+from metis.engine.llm_runner import JsonPromptRequest, JsonPromptRunner
 
-from .finding_normalization import (
-    _finding_from_llm_entry,
-    _safe_int,
-    _same_file_ref,
-)
-from .graph_utils import _chunked, _dedupe_paths
-from .llm_runner import invoke_reachability_prompt, reachability_response_payload
-from .models import (
-    ALLOWED_VULNERABILITY_TYPES,
-    ReachabilityConfirmationResponseModel,
-)
+from .finding_builder import _finding_from_llm_entry
+from .finding_identity import _same_file_ref
+from .finding_values import _safe_int
+from .graph_utils import _chunked, _dedupe_paths, _emit_progress
+from .llm_runner import reachability_response_payload
+from .llm_schemas import ReachabilityConfirmationResponseModel
+from .limits import CONFIRMATION_MAX_TOKENS, CONFIRMATION_PATH_BATCH_SIZE
+from .progress import ReachabilityProgress as Progress
 from .source_context import _read_function_body
+from .workers import run_reachability_jobs
 
 logger = logging.getLogger("metis")
 
 
-def _emit_progress(callback, event, **payload):
-    if callback:
-        callback({"event": event, **payload})
-
-
 def _output_constraints(no_finding_guidance):
-    allowed_vulnerability_types = ", ".join(ALLOWED_VULNERABILITY_TYPES)
     return f"""\
 Use the structured findings schema supplied by the caller.
 For path confirmation, each finding must include path_index and is_vulnerable.
-vulnerability_type must exactly be one of: {allowed_vulnerability_types}.
-Use out_of_bounds for all OOB read/write/index variants, partial_cleanup for
-error-unwind/rollback/resource-leak variants, and use_after_free for dangling
-use-after-release lifetime variants unless a narrower allowed type fits better.
-cwe must be the best matching CWE ID such as CWE-120 when known, otherwise an empty string.
+vulnerability_type must be your best concise snake_case category for the issue;
+do not force it into a predefined taxonomy.
+cwe must be the best matching CWE ID you infer from the issue, such as CWE-120;
+leave it empty only when no CWE is known.
 severity must be exactly one of: critical, high, medium, low.
 confidence must be exactly one of: high, medium, low.
 Be conservative. {no_finding_guidance}"""
@@ -104,8 +91,6 @@ For EACH path determine if it contains a real exploitable vulnerability:
 
 _CONFIRM_USR = "{paths_section}\n\n{code_section}"
 
-# --- Inbound: bugs rooted IN the target file ---
-
 _FILE_CONFIRM_SYS = _confirm_system_prompt(
     """\
 You are a security researcher specializing in C and C++ code analysis.
@@ -135,24 +120,19 @@ _FILE_CONFIRM_USR = """Target file: {target_file}
 
 
 class VulnerabilityConfirmer:
-    """Confirm whether selected source-rooted paths contain real C/C++ defects."""
-
     def __init__(
         self,
         llm_provider,
         model,
         usage_runtime,
         codebase_path,
-        max_tokens=4096,
-        reasoning_effort=None,
+        options,
         threat_model_text=None,
     ):
-        self._p = llm_provider
         self._m = model
-        self._u = usage_runtime
         self._cb = os.path.abspath(codebase_path)
-        self._t = max_tokens
-        self._reasoning_effort = reasoning_effort
+        self._reasoning_effort = options.reasoning_effort
+        self._runner = JsonPromptRunner(llm_provider, usage_runtime)
         self._threat_model_text = threat_model_text
 
     def _with_threat_model(self, prompt: str) -> str:
@@ -199,48 +179,95 @@ class VulnerabilityConfirmer:
                 section.append(f"\n--- {u} (line {n.line_number}) ---\n{body}")
         return "\n".join(section)
 
-    def _run_batches(
+    def _invoke_confirmation(
         self,
-        batches,
-        worker,
-        *,
-        max_workers,
-        progress_callback=None,
+        system_prompt,
+        user_prompt,
+        variables,
+        label,
+        batch_size,
     ):
-        results = []
-        total = len(batches)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                submit_with_current_context(executor, worker, batch): key
-                for key, batch in batches
-            }
-            for completed, future in enumerate(as_completed(futures), start=1):
-                key = futures[future]
-                try:
-                    results.extend(future.result())
-                except Exception as exc:
-                    logger.warning(
-                        "Reachability confirmation failed for %s: %s", key, exc
-                    )
-                _emit_progress(
-                    progress_callback,
-                    "confirmation_progress",
-                    completed=completed,
-                    total=total,
-                    sink=key,
-                    endpoint=key,
-                )
-        return results
+        return self._runner.invoke(
+            JsonPromptRequest(
+                model=self._m,
+                max_tokens=CONFIRMATION_MAX_TOKENS,
+                temperature=0.1,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                variables=variables,
+                parse=reachability_response_payload,
+                logger=logger,
+                label=label,
+                batch_size=batch_size,
+                invalid_message="expected findings list",
+                final_keep_message="keeping this confirmation batch empty",
+                response_model=ReachabilityConfirmationResponseModel,
+                reasoning_effort=self._reasoning_effort,
+            )
+        )
 
-    # --- Bulk confirmation for full-codebase reachability review ---
+    def _path_confirmation_variables(self, batch, graph):
+        return {
+            "paths_section": self._paths_section(
+                batch, graph, "[reachable endpoint; inspect the whole path]"
+            ),
+            "code_section": self._code_section(
+                "== SOURCE CODE ==", self._path_nodes(batch, graph)
+            ),
+        }
+
+    def _file_confirmation_variables(self, target_file, batch, graph):
+        target_nodes, related_nodes = {}, {}
+        for u, n in self._path_nodes(batch, graph).items():
+            if n.file_path == target_file:
+                target_nodes[u] = n
+            else:
+                related_nodes[u] = n
+        return {
+            "target_file": target_file,
+            "paths_section": self._paths_section(
+                batch,
+                graph,
+                "[reachable endpoint; inspect the target-file path]",
+            ),
+            "target_file_code": self._code_section(
+                "-- Functions from target file --",
+                target_nodes,
+                max_chars=5000,
+            ),
+            "related_code_section": self._code_section(
+                "-- Supporting code from other files --",
+                related_nodes,
+                max_chars=2500,
+            ),
+        }
+
+    def _run_batches(self, batches, worker, options):
+        results = []
+        batch_results = run_reachability_jobs(
+            batches,
+            lambda item: worker(item[1]),
+            max_workers=options.max_workers,
+            label="Reachability confirmation",
+            result_key=lambda item: item[0],
+            on_complete=lambda key, completed, total: _emit_progress(
+                options.progress_callback,
+                Progress.CONFIRMATION_PROGRESS,
+                completed=completed,
+                total=total,
+                sink=key,
+                endpoint=key,
+            ),
+        )
+        for batch_result in batch_results:
+            results.extend(batch_result)
+        return results
 
     def confirm_paths(
         self,
         paths,
         graph,
-        *,
-        max_workers=DEFAULT_REACHABILITY_WORKERS,
-        progress_callback=None,
+        options,
     ):
         if not paths:
             return []
@@ -250,42 +277,36 @@ class VulnerabilityConfirmer:
         batches = [
             (sink_name, batch)
             for sink_name, group_paths in groups.items()
-            for batch in _chunked(group_paths, 8)
+            for batch in _chunked(group_paths, CONFIRMATION_PATH_BATCH_SIZE)
         ]
         total = len(batches)
-        _emit_progress(progress_callback, "confirmation_start", total=total)
+        _emit_progress(
+            options.progress_callback, Progress.CONFIRMATION_START, total=total
+        )
         findings = self._run_batches(
             batches,
             lambda batch: self._confirm_batch(batch, graph),
-            max_workers=max_workers,
-            progress_callback=progress_callback,
+            options,
         )
-        _emit_progress(progress_callback, "confirmation_done", confirmed=len(findings))
+        _emit_progress(
+            options.progress_callback,
+            Progress.CONFIRMATION_DONE,
+            confirmed=len(findings),
+        )
         return findings
 
     def _confirm_batch(self, paths, graph):
         batch = list(paths)
-        raw = invoke_reachability_prompt(
-            self._p,
-            self._u,
-            model=self._m,
-            max_tokens=self._t,
+        raw = self._invoke_confirmation(
             system_prompt=self._with_threat_model(_CONFIRM_SYS),
             user_prompt=_CONFIRM_USR,
-            variables={
-                "paths_section": self._paths_section(
-                    batch, graph, "[reachable endpoint; inspect the whole path]"
-                ),
-                "code_section": self._code_section(
-                    "== SOURCE CODE ==", self._path_nodes(batch, graph)
-                ),
-            },
-            response_model=ReachabilityConfirmationResponseModel,
-            reasoning_effort=self._reasoning_effort,
+            variables=self._path_confirmation_variables(batch, graph),
+            label="Reachability confirmation",
+            batch_size=len(batch),
         )
         return self._parse_confirm(raw, batch, graph)
 
-    def _parse_confirm(self, raw, batch, graph, *, target_file=None):
+    def _parse_confirm(self, raw, batch, graph, target_file=None):
         parsed = reachability_response_payload(raw)
         if not isinstance(parsed, dict):
             return []
@@ -316,14 +337,14 @@ class VulnerabilityConfirmer:
             results.append(
                 _finding_from_llm_entry(
                     e,
-                    source_function=rp.source,
-                    source_file=source_file,
-                    source_line=source_line,
-                    sink_function=rp.sink,
-                    sink_file=sink_file,
-                    sink_line=sink_line,
-                    path=rp.path,
-                    analysis_type="reachability",
+                    rp.source,
+                    source_file,
+                    source_line,
+                    rp.sink,
+                    sink_file,
+                    sink_line,
+                    rp.path,
+                    "reachability",
                     default_file=sink_file or source_file,
                     default_function=rp.sink or rp.source,
                     default_line=sink_line or source_line,
@@ -332,49 +353,46 @@ class VulnerabilityConfirmer:
             )
         return results
 
-    def confirm_paths_for_file(self, target_file, paths, graph, *, max_workers=4):
+    def confirm_paths_for_file(
+        self,
+        target_file,
+        paths,
+        graph,
+        options,
+    ):
         paths = _dedupe_paths(paths)
         if not paths:
             return []
-        batches = [(target_file, batch) for batch in _chunked(paths, 8)]
+        batches = [
+            (target_file, batch)
+            for batch in _chunked(paths, CONFIRMATION_PATH_BATCH_SIZE)
+        ]
 
-        return self._run_batches(
+        _emit_progress(
+            options.progress_callback,
+            Progress.CONFIRMATION_START,
+            total=len(batches),
+            file=target_file,
+        )
+        findings = self._run_batches(
             batches,
             lambda batch: self._confirm_file_batch(target_file, batch, graph),
-            max_workers=max(1, min(max_workers, len(batches))),
+            options,
         )
+        _emit_progress(
+            options.progress_callback,
+            Progress.CONFIRMATION_DONE,
+            confirmed=len(findings),
+            file=target_file,
+        )
+        return findings
 
     def _confirm_file_batch(self, target_file, batch, graph):
-        target_nodes, related_nodes = {}, {}
-        for u, n in self._path_nodes(batch, graph).items():
-            if n.file_path == target_file:
-                target_nodes[u] = n
-            else:
-                related_nodes[u] = n
-        raw = invoke_reachability_prompt(
-            self._p,
-            self._u,
-            model=self._m,
-            max_tokens=self._t,
+        raw = self._invoke_confirmation(
             system_prompt=self._with_threat_model(_FILE_CONFIRM_SYS),
             user_prompt=_FILE_CONFIRM_USR,
-            variables={
-                "target_file": target_file,
-                "paths_section": self._paths_section(
-                    batch,
-                    graph,
-                    "[reachable endpoint; inspect the target-file path]",
-                ),
-                "target_file_code": self._code_section(
-                    "-- Functions from target file --", target_nodes, max_chars=5000
-                ),
-                "related_code_section": self._code_section(
-                    "-- Supporting code from other files --",
-                    related_nodes,
-                    max_chars=2500,
-                ),
-            },
-            response_model=ReachabilityConfirmationResponseModel,
-            reasoning_effort=self._reasoning_effort,
+            variables=self._file_confirmation_variables(target_file, batch, graph),
+            label="File reachability confirmation",
+            batch_size=len(batch),
         )
-        return self._parse_confirm(raw, batch, graph, target_file=target_file)
+        return self._parse_confirm(raw, batch, graph, target_file)

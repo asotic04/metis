@@ -1,151 +1,127 @@
 # SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # SPDX-License-Identifier: Apache-2.0
 
-"""Full-codebase tree-sitter reachability service."""
 
-from __future__ import annotations
-
+import json
+import logging
 import os
+import threading
 
-from metis.reachability_settings import (
-    DEFAULT_REACHABILITY_MAX_PATH_LENGTH,
-    DEFAULT_REACHABILITY_MAX_PATHS,
-    DEFAULT_REACHABILITY_MAX_PATHS_PER_SINK,
-    DEFAULT_REACHABILITY_WORKERS,
-)
-
+from metis.engine.llm_runner import JsonPromptRequest, JsonPromptRunner
+from metis.utils import parse_json_output
 from .confirmer import VulnerabilityConfirmer
-from .finding_finalizer import FindingFinalizer
+from .dedup import FINAL_CONSOLIDATION_SYSTEM_PROMPT
+from .finding_finalizer import FindingFinalizer, participates_in_file
 from .graph_cache import ReachabilityGraphCache
 from .graph_utils import (
     _copy_graph_nodes,
+    _emit_progress,
     graph_fingerprint,
     select_confirmation_paths,
 )
-from .models import VulnerabilityFinding
-from .supplementary import SupplementaryAnalyzer
+from .limits import FINAL_ADJUDICATION_MAX_TOKENS
 from .file_focus import FileFocusBuilder
+from .domain import VulnerabilityFinding
+from .options import ReachabilityReviewOptions
+from .progress import ReachabilityProgress as Progress
 from .review_output import group_findings_as_reviews, reviews_for_findings
+from .supplementary import SupplementaryAnalyzer
+from .workers import serialized_progress_callback
+
+logger = logging.getLogger(__name__)
+
+
+def _parse_final_adjudication_response(raw):
+    parsed = parse_json_output(raw)
+    if isinstance(parsed, dict) and isinstance(parsed.get("groups"), list):
+        return parsed
+    return None
 
 
 class TreeSitterReachabilityService:
-    """Coordinate graph building, path tracing, supplementary lenses, and output."""
-
     def __init__(self, config, repository, llm_provider, usage_runtime):
         self._config = config
         self._llm_provider = llm_provider
         self._usage_runtime = usage_runtime
+        self._runner = JsonPromptRunner(llm_provider, usage_runtime)
         self._graphs = ReachabilityGraphCache(config, repository)
         self._finalizer = FindingFinalizer(config.codebase_path)
         self._supplementary_cache: dict[
             tuple[str | int, ...], list[VulnerabilityFinding]
         ] = {}
-
-    def build_graph(self, files=None, *, progress_callback=None):
-        return self._graphs.build_graph(files, progress_callback=progress_callback)
+        self._supplementary_condition = threading.Condition()
+        self._supplementary_inflight: set[tuple[str | int, ...]] = set()
 
     def review_file(
         self,
         file_path,
         *,
-        confirmation_model=None,
-        max_workers=DEFAULT_REACHABILITY_WORKERS,
-        max_paths=DEFAULT_REACHABILITY_MAX_PATHS,
-        max_paths_per_sink=DEFAULT_REACHABILITY_MAX_PATHS_PER_SINK,
-        max_path_length=DEFAULT_REACHABILITY_MAX_PATH_LENGTH,
-        progress_callback=None,
-        reasoning_effort=None,
-        source_functions=None,
-        security_functions=None,
-        domain_hints=None,
-        domain_profiles=None,
-        **_kwargs,
+        options: ReachabilityReviewOptions,
     ):
+        options = self._review_options(options)
         abs_target, relative_target = self._normalize_target_file(file_path)
-        graph = self._graphs.ensure_graph(
-            progress_callback=progress_callback,
-            source_functions=source_functions,
-            security_functions=security_functions,
-        )
+        graph = self._graphs.ensure_graph(options=options)
         if graph.node_count() == 0:
             return None
 
         focus = FileFocusBuilder(
             graph,
-            max_path_length=max_path_length,
-            max_incoming_paths=max_paths if max_paths > 0 else None,
+            max_path_length=options.max_path_length,
+            max_incoming_paths=options.max_paths if options.max_paths > 0 else None,
         ).build(relative_target)
         source_to_file_paths = focus.incoming_paths
         outgoing_context_paths = focus.outgoing_context_paths
-        if progress_callback:
-            progress_callback(
-                {
-                    "event": "treesitter_file_paths_done",
-                    "file": relative_target,
-                    "paths": len(source_to_file_paths),
-                    "source_to_file_paths": len(source_to_file_paths),
-                    "outgoing_context_paths": len(outgoing_context_paths),
-                    "focus_nodes": len(focus.node_names),
-                }
-            )
+        _emit_progress(
+            options.progress_callback,
+            Progress.TREESITTER_FILE_PATHS_DONE,
+            file=relative_target,
+            paths=len(source_to_file_paths),
+            source_to_file_paths=len(source_to_file_paths),
+            outgoing_context_paths=len(outgoing_context_paths),
+            focus_nodes=len(focus.node_names),
+        )
 
-        model = confirmation_model or self._config.llama_query_model
+        model = self._review_model(options)
         focus_graph = _copy_graph_nodes(graph, focus.node_names)
         if focus_graph.node_count() == 0:
             return None
-        supplementary = self._ensure_supplementary(
+        supplementary = self._supplementary_for_graph(
             focus_graph,
             scope_id=relative_target,
             model=model,
-            max_workers=max_workers,
-            progress_callback=progress_callback,
-            reasoning_effort=reasoning_effort,
-            domain_hints=domain_hints,
-            domain_profiles=domain_profiles,
+            options=options,
         )
 
-        confirmer = VulnerabilityConfirmer(
-            self._llm_provider,
-            model,
-            self._usage_runtime,
-            self._config.codebase_path,
-            reasoning_effort=reasoning_effort,
-            threat_model_text=self._config.threat_model_text,
+        path_findings = (
+            self._confirmer(model, options).confirm_paths_for_file(
+                relative_target,
+                source_to_file_paths,
+                graph,
+                options,
+            )
+            if source_to_file_paths
+            else []
         )
 
-        path_findings = []
-        if source_to_file_paths:
-            path_findings.extend(
-                confirmer.confirm_paths_for_file(
-                    relative_target,
-                    source_to_file_paths,
-                    graph,
-                    max_workers=max_workers,
-                )
-            )
-
-        if progress_callback:
-            progress_callback(
-                {
-                    "event": "treesitter_file_review_done",
-                    "file": relative_target,
-                    "supplementary_findings": len(supplementary),
-                    "path_findings": len(path_findings),
-                }
-            )
+        _emit_progress(
+            options.progress_callback,
+            Progress.TREESITTER_FILE_REVIEW_DONE,
+            file=relative_target,
+            supplementary_findings=len(supplementary),
+            path_findings=len(path_findings),
+        )
 
         all_findings = [
             finding
             for finding in list(supplementary) + list(path_findings)
-            if self._finalizer.participates_in_file(finding, relative_target, graph)
+            if participates_in_file(finding, relative_target, graph)
         ]
-        deduped, _total, _removed = self._finalizer.finalize(
+        deduped, _total, _removed = self._finalize_findings(
             all_findings,
             graph,
-            max_paths_per_sink=max_paths_per_sink,
-            max_path_length=max_path_length,
+            options,
+            model=model,
             target_file=relative_target,
-            strict_file=True,
         )
         if not deduped:
             return {"file": relative_target, "file_path": abs_target, "reviews": []}
@@ -161,77 +137,55 @@ class TreeSitterReachabilityService:
     def review_codebase(
         self,
         *,
-        confirmation_model=None,
-        max_workers=DEFAULT_REACHABILITY_WORKERS,
-        max_paths=DEFAULT_REACHABILITY_MAX_PATHS,
-        max_paths_per_sink=DEFAULT_REACHABILITY_MAX_PATHS_PER_SINK,
-        max_path_length=DEFAULT_REACHABILITY_MAX_PATH_LENGTH,
-        progress_callback=None,
-        reasoning_effort=None,
-        source_functions=None,
-        security_functions=None,
-        domain_hints=None,
-        domain_profiles=None,
-        confirm_paths=True,
-        lens_profile="all",
-        **_kwargs,
+        options: ReachabilityReviewOptions,
+        files=None,
     ):
-        graph, paths = self.get_codebase_graph_and_paths(
-            max_path_length=max_path_length,
-            progress_callback=progress_callback,
-            source_functions=source_functions,
-            security_functions=security_functions,
+        options = self._review_options(options)
+        graph, paths = self._graphs.get_codebase_graph_and_paths(
+            files=files,
+            options=options,
         )
         if graph.node_count() == 0:
             return []
         selected_paths = []
-        if confirm_paths:
+        if options.confirm_paths:
             selected_paths = select_confirmation_paths(
-                paths, graph, max_paths=max_paths
+                paths, graph, max_paths=options.max_paths
             )
-        if progress_callback:
-            progress_callback(
-                {
-                    "event": "treesitter_paths_done",
-                    "paths": len(paths),
-                    "selected": len(selected_paths),
-                    "confirmation_enabled": bool(confirm_paths),
-                }
-            )
+        _emit_progress(
+            options.progress_callback,
+            Progress.TREESITTER_PATHS_DONE,
+            paths=len(paths),
+            selected=len(selected_paths),
+            confirmation_enabled=bool(options.confirm_paths),
+        )
 
-        model = confirmation_model or self._config.llama_query_model
-        supplementary = self._ensure_supplementary(
+        model = self._review_model(options)
+        supplementary = self._supplementary_for_graph(
             graph,
             scope_id="whole_graph",
             model=model,
-            max_workers=max_workers,
-            progress_callback=progress_callback,
-            reasoning_effort=reasoning_effort,
-            lens_profile=lens_profile,
-            domain_hints=domain_hints,
-            domain_profiles=domain_profiles,
+            options=options,
         )
-        path_findings = []
-        if selected_paths:
-            confirmer = VulnerabilityConfirmer(
-                self._llm_provider,
-                model,
-                self._usage_runtime,
-                self._config.codebase_path,
-                reasoning_effort=reasoning_effort,
-            )
-            path_findings = confirmer.confirm_paths(
+        path_findings = (
+            self._confirmer(model, options).confirm_paths(
                 selected_paths,
                 graph,
-                max_workers=max_workers,
-                progress_callback=progress_callback,
+                options,
             )
+            if selected_paths
+            else []
+        )
 
-        deduped_findings, total_before, removed = self._finalizer.finalize(
+        deduped_findings, total_before, removed = self._finalize_findings(
             list(supplementary) + list(path_findings),
             graph,
-            max_path_length=max_path_length,
-            max_paths_per_sink=max_paths_per_sink,
+            options,
+            model=model,
+            progress_counts={
+                "supplementary_findings": len(supplementary),
+                "path_findings": len(path_findings),
+            },
         )
 
         reviews = group_findings_as_reviews(
@@ -239,85 +193,171 @@ class TreeSitterReachabilityService:
             graph,
             codebase_path=self._config.codebase_path,
         )
-        if progress_callback:
-            progress_callback(
-                {
-                    "event": "treesitter_code_review_done",
-                    "supplementary_findings": len(supplementary),
-                    "path_findings": len(path_findings),
-                    "raw_findings": total_before,
-                    "deduped_findings": len(deduped_findings),
-                    "removed_findings": removed,
-                    "files": len(reviews),
-                }
-            )
+        _emit_progress(
+            options.progress_callback,
+            Progress.TREESITTER_CODE_REVIEW_DONE,
+            supplementary_findings=len(supplementary),
+            path_findings=len(path_findings),
+            raw_findings=total_before,
+            deduped_findings=len(deduped_findings),
+            removed_findings=removed,
+            files=len(reviews),
+        )
         return reviews
 
-    def annotate_findings_with_source_paths(
-        self, findings, graph, *, max_path_length=DEFAULT_REACHABILITY_MAX_PATH_LENGTH
-    ):
-        return self._finalizer.annotate_findings_with_source_paths(
-            findings,
-            graph,
-            max_path_length=max_path_length,
+    def _review_options(self, options):
+        if options.progress_callback is None:
+            return options
+        return options.with_progress_callback(
+            serialized_progress_callback(options.progress_callback)
         )
 
-    def get_codebase_graph_and_paths(
-        self,
-        *,
-        max_path_length=DEFAULT_REACHABILITY_MAX_PATH_LENGTH,
-        progress_callback=None,
-        source_functions=None,
-        security_functions=None,
-    ):
-        return self._graphs.get_codebase_graph_and_paths(
-            max_path_length=max_path_length,
-            progress_callback=progress_callback,
-            source_functions=source_functions,
-            security_functions=security_functions,
+    def adjudicate_final_findings(self, candidates, *, model, reasoning_effort=None):
+        return self._adjudicate_final_findings(
+            candidates,
+            model=model,
+            reasoning_effort=reasoning_effort,
         )
 
-    def _ensure_supplementary(
+    def _adjudicate_final_findings(self, candidates, *, model, reasoning_effort=None):
+        if not candidates:
+            return None
+        return self._runner.invoke(
+            JsonPromptRequest(
+                model=model,
+                max_tokens=FINAL_ADJUDICATION_MAX_TOKENS,
+                temperature=0.1,
+                system_prompt=FINAL_CONSOLIDATION_SYSTEM_PROMPT,
+                user_prompt="Candidate findings JSON:\n{candidate_findings}",
+                variables={
+                    "candidate_findings": json.dumps(candidates, separators=(",", ":"))
+                },
+                parse=_parse_final_adjudication_response,
+                logger=logger,
+                label="Final reachability dedup adjudication",
+                batch_size=len(candidates),
+                invalid_message="expected JSON object with groups list",
+                final_keep_message="keeping this batch unchanged",
+                reasoning_effort=reasoning_effort,
+            )
+        )
+
+    def _supplementary_for_graph(
         self,
         graph,
         *,
         scope_id="whole_graph",
         model,
-        max_workers,
-        progress_callback=None,
-        reasoning_effort=None,
-        lens_profile="all",
-        domain_hints=None,
-        domain_profiles=None,
+        options: ReachabilityReviewOptions,
     ):
-        key = (
-            str(scope_id or "whole_graph"),
-            str(model or ""),
-            str(reasoning_effort or ""),
-            str(lens_profile or "all"),
-            repr(domain_hints or ()),
-            repr(domain_profiles or ()),
+        cache_options = options.with_confirmation_model(model)
+        key = cache_options.supplementary_cache_key(
+            scope_id,
             graph_fingerprint(graph),
         )
-        cached = self._supplementary_cache.get(key)
-        if cached is not None:
-            return list(cached)
-        findings = SupplementaryAnalyzer(
+        with self._supplementary_condition:
+            cached = self._supplementary_cache.get(key)
+            if cached is not None:
+                return list(cached)
+            if key in self._supplementary_inflight:
+                while key in self._supplementary_inflight:
+                    self._supplementary_condition.wait()
+                cached = self._supplementary_cache.get(key)
+                if cached is not None:
+                    return list(cached)
+            self._supplementary_inflight.add(key)
+
+        try:
+            findings = SupplementaryAnalyzer(
+                self._llm_provider,
+                model,
+                self._usage_runtime,
+                self._config.codebase_path,
+                options=options,
+            ).analyze(
+                graph,
+                options=options,
+            )
+        except Exception:
+            with self._supplementary_condition:
+                self._supplementary_inflight.discard(key)
+                self._supplementary_condition.notify_all()
+            raise
+
+        with self._supplementary_condition:
+            self._supplementary_cache[key] = list(findings)
+            self._supplementary_inflight.discard(key)
+            self._supplementary_condition.notify_all()
+        return list(findings)
+
+    def _finalize_findings(
+        self,
+        findings,
+        graph,
+        options: ReachabilityReviewOptions,
+        *,
+        model,
+        target_file=None,
+        progress_counts=None,
+    ):
+        progress_counts = dict(progress_counts or {})
+        _emit_progress(
+            options.progress_callback,
+            Progress.FINDINGS_FINALIZATION_START,
+            candidates=len(findings),
+            file=target_file,
+            **progress_counts,
+        )
+
+        def _adjudication_progress(payload):
+            _emit_progress(
+                options.progress_callback,
+                Progress.FINDINGS_FINALIZATION_PROGRESS,
+                file=target_file,
+                **payload,
+                **progress_counts,
+            )
+
+        def _adjudicate_candidates(candidates):
+            return self.adjudicate_final_findings(
+                candidates,
+                model=model,
+                reasoning_effort=options.reasoning_effort,
+            )
+
+        finalized = self._finalizer.finalize(
+            findings,
+            graph,
+            options=options,
+            target_file=target_file,
+            final_adjudicator=_adjudicate_candidates,
+            final_adjudication_progress=_adjudication_progress,
+        )
+        deduped, total_before, removed = finalized
+        _emit_progress(
+            options.progress_callback,
+            Progress.FINDINGS_FINALIZATION_DONE,
+            candidates=len(findings),
+            raw_findings=total_before,
+            deduped_findings=len(deduped),
+            removed_findings=removed,
+            file=target_file,
+            **progress_counts,
+        )
+        return finalized
+
+    def _review_model(self, options: ReachabilityReviewOptions):
+        return options.confirmation_model or self._config.llama_query_model
+
+    def _confirmer(self, model, options):
+        return VulnerabilityConfirmer(
             self._llm_provider,
             model,
             self._usage_runtime,
             self._config.codebase_path,
-            reasoning_effort=reasoning_effort,
-            domain_hints=domain_hints,
-            domain_profiles=domain_profiles,
-        ).analyze(
-            graph,
-            max_workers=max_workers,
-            progress_callback=progress_callback,
-            lens_profile=lens_profile,
+            options,
+            threat_model_text=self._config.threat_model_text,
         )
-        self._supplementary_cache[key] = list(findings)
-        return list(findings)
 
     def _normalize_target_file(self, file_path):
         base_path = os.path.abspath(self._config.codebase_path)

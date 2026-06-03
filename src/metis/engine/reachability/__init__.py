@@ -1,26 +1,16 @@
 # SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tree-sitter reachability review package."""
 
-from __future__ import annotations
-
-from .dedup import Deduplicator
-from .models import (
-    FunctionNode,
-    GlobalConstruct,
-    ReachabilityGraph,
-    ReachabilityPath,
-    VulnerabilityFinding,
+from .dedup import (
+    Deduplicator as Deduplicator,
+    FindingConsolidator as FindingConsolidator,
 )
-from .tracing import SourceRootedPathTracer
-
-__all__ = [
-    "Deduplicator",
-    "FunctionNode",
-    "GlobalConstruct",
-    "ReachabilityGraph",
-    "ReachabilityPath",
-    "SourceRootedPathTracer",
-    "VulnerabilityFinding",
-]
+from .domain import (
+    FunctionNode as FunctionNode,
+    GlobalConstruct as GlobalConstruct,
+    ReachabilityPath as ReachabilityPath,
+    VulnerabilityFinding as VulnerabilityFinding,
+)
+from .graph import ReachabilityGraph as ReachabilityGraph
+from .tracing import SourceRootedPathTracer as SourceRootedPathTracer

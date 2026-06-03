@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # SPDX-License-Identifier: Apache-2.0
 
-"""Supplementary reachability lens registry and prompt metadata."""
-
-from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
+from .limits import (
+    SUPPLEMENTARY_CANDIDATE_INTRA_PER_FUNCTION_CHARS,
+    SUPPLEMENTARY_CANDIDATE_MAX_TOTAL_CHARS,
+    SUPPLEMENTARY_CANDIDATE_SEMANTIC_PER_FUNCTION_CHARS,
+)
 from .supplementary_prompts import (
     _CLASSIC_C_SINK_SYS,
     _COUNTER_SYMMETRY_SYS,
@@ -15,67 +18,138 @@ from .supplementary_prompts import (
 )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _SupplementaryLensSpec:
     name: str
     kind: str
     method_name: str = ""
     sys_prompt: str = ""
     analysis_type: str = ""
+    max_total_chars: int = 0
+    per_fn_chars: int = 0
+    sinks_only: bool = False
+    parser: str = "intra"
+
+    def runs_as_combined_graph(self) -> bool:
+        return self.kind in _COMBINED_GRAPH_LENS_KINDS
+
+    def uses_method_runner(self) -> bool:
+        return bool(self.method_name)
+
+    def uses_candidate_runner(self) -> bool:
+        return bool(self.sys_prompt)
+
+    def parses_semantic_entries(self) -> bool:
+        return self.parser == "semantic"
 
 
-_FULL_LENS_SPECS = (
-    _SupplementaryLensSpec("intra_audit", "method", method_name="_lens_intra"),
-    _SupplementaryLensSpec("lifecycle_audit", "cross", analysis_type="lifecycle"),
-    _SupplementaryLensSpec("ownership_audit", "cross", analysis_type="ownership"),
-    _SupplementaryLensSpec("semantic_audit", "semantic", analysis_type="semantic"),
-    _SupplementaryLensSpec(
-        "state_audit", "semantic", analysis_type="state_concurrency"
-    ),
-    _SupplementaryLensSpec(
-        "targeted_state_order", "targeted", analysis_type="targeted_state_order"
-    ),
-    _SupplementaryLensSpec(
-        "targeted_callback_lifecycle",
-        "targeted",
-        analysis_type="targeted_callback_lifecycle",
-    ),
-    _SupplementaryLensSpec(
-        "targeted_refcount", "targeted", analysis_type="targeted_refcount"
-    ),
-    _SupplementaryLensSpec(
-        "targeted_permission", "targeted", analysis_type="targeted_permission"
-    ),
-    _SupplementaryLensSpec(
-        "targeted_toctou", "targeted", analysis_type="targeted_toctou"
-    ),
-    _SupplementaryLensSpec(
-        "classic_c_sink",
-        "candidate_intra",
-        sys_prompt=_CLASSIC_C_SINK_SYS,
-        analysis_type="classic_c_sink",
-    ),
-    _SupplementaryLensSpec(
-        "error_unwind",
-        "candidate_semantic",
-        sys_prompt=_ERROR_UNWIND_SYS,
-        analysis_type="error_unwind",
-    ),
-    _SupplementaryLensSpec(
-        "counter_symmetry",
-        "candidate_semantic",
-        sys_prompt=_COUNTER_SYMMETRY_SYS,
-        analysis_type="counter_symmetry",
-    ),
-    _SupplementaryLensSpec("global_lifecycle", "method", "_lens_global_lifecycle"),
-    _SupplementaryLensSpec("lock_order_extraction", "method", "_lens_lock_order"),
-    _SupplementaryLensSpec(
-        "targeted_path_access",
-        "candidate_semantic",
-        sys_prompt=_TARGET_PATH_ACCESS_SYS,
-        analysis_type="targeted_path_access",
-    ),
+class SupplementaryLens(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    def run(self, analyzer, graph, options): ...
+
+
+@dataclass(frozen=True)
+class _CombinedGraphLens:
+    specs: tuple[_SupplementaryLensSpec, ...]
+    name: str = "combined_graph_lenses"
+
+    def run(self, analyzer, graph, options):
+        return analyzer.run_combined_graph_lenses(self.specs, graph, options)
+
+
+@dataclass(frozen=True)
+class _SpecLens:
+    spec: _SupplementaryLensSpec
+
+    @property
+    def name(self):
+        return self.spec.name
+
+    def run(self, analyzer, graph, options):
+        if self.spec.uses_method_runner():
+            return getattr(analyzer, self.spec.method_name)(graph, options)
+        if self.spec.uses_candidate_runner():
+            return analyzer.run_candidate_lens(graph, self.spec, options)
+        raise ValueError(f"unknown supplementary lens kind: {self.spec.kind}")
+
+
+_PROMPTS = {
+    "classic_c_sink": _CLASSIC_C_SINK_SYS,
+    "error_unwind": _ERROR_UNWIND_SYS,
+    "counter_symmetry": _COUNTER_SYMMETRY_SYS,
+    "targeted_path_access": _TARGET_PATH_ACCESS_SYS,
+}
+
+
+def _lens_spec(name: str, kind: str, method: str, analysis_type: str):
+    candidate_intra = kind == "candidate_intra"
+    candidate_semantic = kind == "candidate_semantic"
+    return _SupplementaryLensSpec(
+        name,
+        kind,
+        method_name=method,
+        sys_prompt=_PROMPTS.get(analysis_type, ""),
+        analysis_type=analysis_type,
+        max_total_chars=(
+            SUPPLEMENTARY_CANDIDATE_MAX_TOTAL_CHARS
+            if candidate_intra or candidate_semantic
+            else 0
+        ),
+        per_fn_chars=(
+            SUPPLEMENTARY_CANDIDATE_INTRA_PER_FUNCTION_CHARS
+            if candidate_intra
+            else SUPPLEMENTARY_CANDIDATE_SEMANTIC_PER_FUNCTION_CHARS
+            if candidate_semantic
+            else 0
+        ),
+        sinks_only=analysis_type == "classic_c_sink",
+        parser="semantic" if candidate_semantic else "intra",
+    )
+
+
+_FULL_LENS_SPECS = tuple(
+    _lens_spec(name, kind, method, analysis_type)
+    for name, kind, method, analysis_type in (
+        ("intra_audit", "method", "_lens_intra", ""),
+        ("lifecycle_audit", "cross", "", "lifecycle"),
+        ("ownership_audit", "cross", "", "ownership"),
+        ("semantic_audit", "semantic", "", "semantic"),
+        ("state_audit", "semantic", "", "state_concurrency"),
+        ("targeted_state_order", "targeted", "", "targeted_state_order"),
+        ("targeted_callback_lifecycle", "targeted", "", "targeted_callback_lifecycle"),
+        ("targeted_refcount", "targeted", "", "targeted_refcount"),
+        ("targeted_permission", "targeted", "", "targeted_permission"),
+        ("targeted_toctou", "targeted", "", "targeted_toctou"),
+        ("classic_c_sink", "candidate_intra", "", "classic_c_sink"),
+        ("error_unwind", "candidate_semantic", "", "error_unwind"),
+        ("counter_symmetry", "candidate_semantic", "", "counter_symmetry"),
+        ("global_lifecycle", "method", "_lens_global_lifecycle", ""),
+        ("lock_order_extraction", "method", "_lens_lock_order", ""),
+        ("targeted_path_access", "candidate_semantic", "", "targeted_path_access"),
+    )
 )
+
+
+def build_supplementary_lenses(profile: str = "all") -> list[SupplementaryLens]:
+    lens_specs = selected_lens_specs(profile)
+    combined_specs = tuple(spec for spec in lens_specs if spec.runs_as_combined_graph())
+    lenses: list[SupplementaryLens] = []
+    if combined_specs:
+        lenses.append(_CombinedGraphLens(combined_specs))
+    lenses.extend(
+        _SpecLens(spec) for spec in lens_specs if not spec.runs_as_combined_graph()
+    )
+    return lenses
+
+
+def selected_lens_specs(profile: str = "all") -> list[_SupplementaryLensSpec]:
+    profile = str(profile or "all").lower()
+    if profile == "review":
+        return [spec for spec in _FULL_LENS_SPECS if spec.name in _REVIEW_LENS_NAMES]
+    return list(_FULL_LENS_SPECS)
+
 
 _REVIEW_LENS_NAMES = set(
     "intra_audit lifecycle_audit ownership_audit semantic_audit "

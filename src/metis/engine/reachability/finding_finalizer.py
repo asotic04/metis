@@ -1,21 +1,47 @@
 # SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # SPDX-License-Identifier: Apache-2.0
 
-"""Finding path annotation, filtering, and deduplication."""
-
-from __future__ import annotations
 
 from metis.reachability_settings import DEFAULT_REACHABILITY_MAX_PATH_LENGTH
 
-from .dedup import Deduplicator
+from .dedup import FindingConsolidator
 from .finding_paths import FindingPathAnnotator
+from .finding_values import _normalise_vuln_type
 from .graph_utils import _same_file
-from .post_filters import _post_filter_findings, _strict_file_findings
+
+
+def participates_in_file(finding, target_file, graph):
+    if any(
+        _same_file(file_name, target_file)
+        for file_name in (
+            finding.primary_file,
+            finding.source_file,
+            finding.sink_file,
+        )
+    ):
+        return True
+    for node_name in list(finding.path or []) + [
+        finding.primary_function,
+        finding.source_function,
+        finding.sink_function,
+    ]:
+        node = graph.get_node(node_name) if graph is not None else None
+        if node and _same_file(node.file_path, target_file):
+            return True
+        if str(node_name or "").startswith(f"{target_file}::"):
+            return True
+    return False
+
+
+def _normalise_finding_types(findings):
+    for finding in findings:
+        finding.vulnerability_type = _normalise_vuln_type(
+            getattr(finding, "vulnerability_type", "")
+        )
+    return findings
 
 
 class FindingFinalizer:
-    """Prepare reachability findings for review output."""
-
     def __init__(self, codebase_path: str):
         self._codebase_path = codebase_path
 
@@ -24,19 +50,19 @@ class FindingFinalizer:
         findings,
         graph,
         *,
-        max_paths_per_sink,
-        max_path_length=DEFAULT_REACHABILITY_MAX_PATH_LENGTH,
+        options,
         target_file="",
-        strict_file=False,
+        final_adjudicator=None,
+        final_adjudication_progress=None,
     ):
+        max_paths_per_sink = options.max_paths_per_sink
+        max_path_length = options.max_path_length
         if target_file:
             findings = FindingPathAnnotator(
                 graph,
                 target_file,
                 max_path_length=max_path_length,
             ).annotate(findings)
-            if strict_file:
-                findings = _strict_file_findings(findings)
         else:
             findings = self.annotate_findings_with_source_paths(
                 findings,
@@ -44,10 +70,16 @@ class FindingFinalizer:
                 max_path_length=max_path_length,
             )
 
-        findings = _post_filter_findings(findings, self._codebase_path)
+        findings = _normalise_finding_types(findings)
         if not findings:
             return [], 0, 0
-        return Deduplicator.deduplicate(findings, max_per_sink=max_paths_per_sink)
+        return FindingConsolidator.deduplicate(
+            findings,
+            max_per_sink=max_paths_per_sink,
+            final_adjudicator=final_adjudicator,
+            final_adjudication_progress=final_adjudication_progress,
+            max_workers=options.max_workers,
+        )
 
     def annotate_findings_with_source_paths(
         self,
@@ -75,26 +107,3 @@ class FindingFinalizer:
                 annotators[target_file] = annotator
             annotated.append(annotator.annotate_one(finding))
         return annotated
-
-    @staticmethod
-    def participates_in_file(finding, target_file, graph):
-        if any(
-            _same_file(file_name, target_file)
-            for file_name in (
-                finding.primary_file,
-                finding.source_file,
-                finding.sink_file,
-            )
-        ):
-            return True
-        for node_name in list(finding.path or []) + [
-            finding.primary_function,
-            finding.source_function,
-            finding.sink_function,
-        ]:
-            node = graph.get_node(node_name) if graph is not None else None
-            if node and _same_file(node.file_path, target_file):
-                return True
-            if str(node_name or "").startswith(f"{target_file}::"):
-                return True
-        return False

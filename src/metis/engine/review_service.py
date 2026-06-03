@@ -1,19 +1,15 @@
 # SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
-
 import inspect
 import logging
 import os
-import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-import unidiff
+import unidiff  # type: ignore[import-untyped]
 
-from metis.plugins.c_family import is_c_family_plugin
 from metis.usage import submit_with_current_context
 from metis.utils import read_file_content
 
@@ -21,7 +17,11 @@ from .diff_utils import process_diff_file
 from .graphs.types import ReviewRequest
 from .helpers import apply_custom_guidance, summarize_changes
 from .options import ReviewOptions, coerce_review_options
+from .reachability.progress import ReachabilityProgress as Progress
+from .reachability.progress import emit_progress
 from .repository import EngineRepository
+from .review_reachability import ReachabilityReviewBackend
+from .review_validation import ReviewFindingValidator
 from .runtime import EngineConfig
 
 logger = logging.getLogger("metis")
@@ -41,10 +41,16 @@ class ReviewService:
         self._repository = repository
         self._get_query_engines = get_query_engines
         self._review_graph_factory = review_graph_factory
-        self._reachability_service = reachability_service
-        self._reachability_settings = dict(reachability_settings or {})
-        self._reachability_cache = None
-        self._reachability_lock = threading.Lock()
+        self._reachability_backend = (
+            ReachabilityReviewBackend(
+                config,
+                repository,
+                reachability_service,
+                reachability_settings,
+            )
+            if reachability_service is not None
+            else None
+        )
 
     def get_code_files(self, options: ReviewOptions | None = None):
         options = coerce_review_options(options)
@@ -52,30 +58,60 @@ class ReviewService:
             include_suffixed_sources=not options.use_retrieval_context
         )
 
-    def _get_reachability_reviews(self, *, progress_callback=None):
-        if self._reachability_cache is not None:
-            return list(self._reachability_cache)
+    def _get_reachability_reviews(self, *, files=None, progress_callback=None):
+        if self._reachability_backend is None:
+            return []
+        return self._reachability_backend.codebase_reviews(
+            files=files,
+            progress_callback=progress_callback,
+        )
 
-        with self._reachability_lock:
-            if self._reachability_cache is None:
-                settings = self._reachability_call_settings(
-                    progress_callback=progress_callback,
-                    codebase=True,
-                )
-                self._reachability_cache = self._reachability_service.review_codebase(
-                    **settings
-                )
-        return list(self._reachability_cache)
+    def _finalize_single_review_result(self, result):
+        if result is None:
+            return None
+        finalized = self.aggregate_review_results({"reviews": [result]})
+        groups = finalized.get("reviews") if isinstance(finalized, dict) else None
+        if isinstance(groups, list) and groups:
+            return groups[0]
+        return result
 
-    def _reachability_call_settings(self, *, progress_callback=None, codebase=False):
-        settings = dict(self._reachability_settings)
-        if codebase:
-            settings.setdefault("lens_profile", "review")
-            if not settings.get("max_paths"):
-                settings.setdefault("confirm_paths", False)
-        if progress_callback is not None:
-            settings["progress_callback"] = progress_callback
-        return settings
+    def aggregate_review_results(self, results, *, deduplicate=True):
+        if self._reachability_backend is None:
+            return results
+        return self._reachability_backend.aggregate_results(
+            results,
+            validate_candidates=self._validate_review_candidates,
+            deduplicate=deduplicate,
+        )
+
+    def _validate_review_candidates(self, candidates):
+        if self._reachability_backend is not None:
+            return self._reachability_backend.validate_candidates(candidates)
+        return ReviewFindingValidator(
+            self._config,
+            {},
+        ).validate_candidates(candidates)
+
+    def _invoke_review_validation_batch(self, batch, *, model, reasoning_effort=None):
+        if self._reachability_backend is not None:
+            return self._reachability_backend.invoke_validation_batch(
+                batch,
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+        return ReviewFindingValidator(
+            self._config,
+            {},
+        ).invoke_batch(
+            batch,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+
+    def _reachability_final_adjudicator(self):
+        if self._reachability_backend is None:
+            return None
+        return self._reachability_backend.final_adjudicator()
 
     def review_file(
         self,
@@ -90,15 +126,15 @@ class ReviewService:
             use_retrieval_context=use_retrieval_context,
         )
         if (
-            self._reachability_service is not None
-            and self._is_file_in_codebase(file_path)
-            and self._is_c_family_file(file_path)
+            self._reachability_backend is not None
+            and self._reachability_backend.is_file_in_codebase(file_path)
+            and self._reachability_backend.supports_file(file_path)
         ):
             try:
-                settings = self._reachability_call_settings(
-                    progress_callback=progress_callback
+                result = self._reachability_backend.file_review(
+                    file_path,
+                    progress_callback=progress_callback,
                 )
-                result = self._reachability_service.review_file(file_path, **settings)
             except Exception:
                 logger.debug(
                     "Tree-sitter file review failed for %s; falling back to standard review",
@@ -107,8 +143,25 @@ class ReviewService:
                 )
             else:
                 if result is not None:
-                    return result
-        return self._review_file_standard(file_path, options=options)
+                    return self._finalize_single_review_result(result)
+        return self._finalize_single_review_result(
+            self._review_file_standard(file_path, options=options)
+        )
+
+    def _get_global_reachability_review_for_file(
+        self,
+        file_path,
+        *,
+        progress_callback=None,
+    ):
+        if self._reachability_backend is None:
+            abs_path = os.path.abspath(str(file_path))
+            relative_path = self._repository.normalize_match_path(abs_path)
+            return {"file": relative_path, "file_path": abs_path, "reviews": []}
+        return self._reachability_backend.file_review(
+            file_path,
+            progress_callback=progress_callback,
+        )
 
     def _review_file_standard(
         self,
@@ -160,15 +213,16 @@ class ReviewService:
             return None
 
     def _is_file_in_codebase(self, file_path):
-        try:
-            base = os.path.abspath(self._config.codebase_path)
-            target = os.path.abspath(str(file_path))
-            return os.path.commonpath([base, target]) == base
-        except (OSError, ValueError):
-            return False
+        return bool(
+            self._reachability_backend
+            and self._reachability_backend.is_file_in_codebase(file_path)
+        )
 
-    def _is_c_family_file(self, file_path):
-        return is_c_family_plugin(self._repository.get_plugin_for_path(str(file_path)))
+    def _supports_reachability_file(self, file_path):
+        return bool(
+            self._reachability_backend
+            and self._reachability_backend.supports_file(file_path)
+        )
 
     def _invoke_review_file(
         self,
@@ -186,7 +240,7 @@ class ReviewService:
             accepts_kwargs = any(
                 p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
             )
-            kwargs = {}
+            kwargs: dict[str, Any] = {}
             if "options" in params or accepts_kwargs:
                 kwargs["options"] = options
             if "use_retrieval_context" in params:
@@ -223,17 +277,21 @@ class ReviewService:
         if not files:
             return
 
-        c_family_files = [path for path in files if self._is_c_family_file(path)]
+        reachability_backend = self._reachability_backend
         run_codebase_reachability = (
-            self._reachability_service is not None
-            and review_file_func is None
-            and bool(c_family_files)
+            reachability_backend is not None
+            and reachability_backend.should_review_codebase(
+                files,
+                review_file_func=review_file_func,
+            )
         )
         reachability_failed = False
         if run_codebase_reachability:
+            assert reachability_backend is not None
             try:
                 results = self._get_reachability_reviews(
-                    progress_callback=progress_callback
+                    files=files,
+                    progress_callback=progress_callback,
                 )
             except Exception:
                 logger.debug(
@@ -242,21 +300,25 @@ class ReviewService:
                 )
                 reachability_failed = True
             else:
-                results = list(results)
+                emit_progress(
+                    progress_callback,
+                    Progress.REVIEW_OUTPUT_AGGREGATION_START,
+                    files=len(results),
+                )
+                results = self.aggregate_review_results(
+                    {"reviews": results},
+                    deduplicate=False,
+                ).get("reviews", results)
+                emit_progress(
+                    progress_callback,
+                    Progress.REVIEW_OUTPUT_AGGREGATION_DONE,
+                    files=len(results),
+                )
                 for result in results:
                     yield result
-                if results:
-                    files = [
-                        path for path in files if not self._is_c_family_file(path)
-                    ]
-                    if not files:
-                        return
-                else:
-                    logger.debug(
-                        "Tree-sitter codebase review returned no findings; "
-                        "falling back to standard C-family review"
-                    )
-                    reachability_failed = True
+                files = reachability_backend.remaining_standard_files(files)
+                if not files:
+                    return
 
         review_fn = (
             self._review_file_standard

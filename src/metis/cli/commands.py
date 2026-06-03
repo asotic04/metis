@@ -4,6 +4,7 @@
 
 import importlib
 import copy
+import inspect
 import json
 import logging
 from datetime import datetime
@@ -17,6 +18,7 @@ from metis.engine.llm_triage_service import (
 )
 from metis.engine.options import ReviewOptions, TriageOptions
 from .command_runtime import CommandRuntime
+from .review_progress import ReviewCodeProgressReporter
 from metis.utils import read_file_content, safe_decode_unicode
 from metis.sarif.writer import generate_sarif
 from metis.usage import usage_operation
@@ -27,6 +29,7 @@ from .utils import (
     with_timer,
     collect_reviews,
     iterate_with_progress,
+    build_standard_progress,
     count_index_items,
     pretty_print_reviews,
     save_output,
@@ -137,12 +140,19 @@ def run_file_review(engine, file_path, args, runtime: CommandRuntime):
 def run_review_code(engine, args, runtime: CommandRuntime):
     _print_no_index_warning(args, runtime)
     options = _review_options_for_runtime(runtime)
-    if args.verbose:
-        print_console("[cyan]Reviewing codebase...[/cyan]", args.quiet)
-        total = len(engine.review.get_code_files(options=options))
+    if not args.quiet:
+        code_files = list(engine.review.get_code_files(options=options))
+        file_reviews = _collect_review_code_with_progress(
+            engine,
+            options,
+            code_files,
+        )
+        results = {"reviews": file_reviews}
+    elif args.verbose:
+        code_files = list(engine.review.get_code_files(options=options))
         file_reviews = iterate_with_progress(
-            total,
-            engine.review.review_code(options=options),
+            len(code_files),
+            _review_code_iter(engine.review, options, code_files=code_files),
         )
         results = {"reviews": file_reviews}
     else:
@@ -154,6 +164,52 @@ def run_review_code(engine, args, runtime: CommandRuntime):
             quiet=args.quiet,
         )
     _finalize_review_output(engine, results, args, runtime)
+
+
+def _collect_review_code_with_progress(engine, options, code_files):
+    results = []
+    total = len(code_files)
+    with build_standard_progress(transient=True) as progress:
+        progress_reporter = ReviewCodeProgressReporter(
+            progress,
+            total_files=total,
+        )
+        for item in _review_code_iter(
+            engine.review,
+            options,
+            progress_callback=progress_reporter,
+            code_files=code_files,
+        ):
+            if item is not None:
+                results.append(item)
+            progress_reporter.review_result()
+        progress_reporter.finish()
+    return results
+
+
+def _review_code_iter(review_domain, options, progress_callback=None, code_files=None):
+    review_code = review_domain.review_code
+    kwargs = {"options": options}
+    try:
+        signature = inspect.signature(review_code)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        params = signature.parameters
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        )
+        if progress_callback is not None and (
+            "progress_callback" in params or accepts_kwargs
+        ):
+            kwargs["progress_callback"] = progress_callback
+        if code_files is not None and (
+            "get_code_files_func" in params or accepts_kwargs
+        ):
+            kwargs["get_code_files_func"] = lambda: code_files
+    elif progress_callback is not None:
+        kwargs["progress_callback"] = progress_callback
+    return review_code(**kwargs)
 
 
 def run_index(engine, verbose=False, quiet=False):

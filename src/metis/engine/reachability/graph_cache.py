@@ -1,12 +1,10 @@
 # SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reachability graph and path caching."""
 
-from __future__ import annotations
+import threading
 
 from metis.reachability_settings import DEFAULT_REACHABILITY_MAX_PATH_LENGTH
-from metis.plugins.c_family import is_c_family_plugin
 
 from .c_family import CFamilyTreeSitterExtractor
 from .c_family_rules import (
@@ -14,23 +12,24 @@ from .c_family_rules import (
     _normalise_source_function_specs,
     external_sink_type,
 )
-from .models import ReachabilityGraph
+from .graph_utils import _emit_progress
+from .graph import ReachabilityGraph
+from .progress import ReachabilityProgress as Progress
 from .tracing import SourceRootedPathTracer
 
 
 class ReachabilityGraphCache:
-    """Build and cache the C/C++ reachability graph plus traced paths."""
-
     def __init__(self, config, repository):
         self._config = config
         self._repository = repository
         self._extractor = CFamilyTreeSitterExtractor(repository)
-        self._graph = None
-        self._paths = None
-        self._paths_max_length = None
+        self._base_graph = None
+        self._graphs = {}
+        self._paths = {}
+        self._lock = threading.RLock()
 
     def build_graph(self, files=None, *, progress_callback=None):
-        selected = self._c_family_files(
+        selected = self._reachability_files(
             files if files is not None else self._repository.get_code_files()
         )
         return self._build_graph_from_files(
@@ -40,85 +39,133 @@ class ReachabilityGraphCache:
         )
 
     def ensure_graph(
-        self, *, progress_callback=None, source_functions=None, security_functions=None
+        self,
+        *,
+        files=None,
+        options=None,
+        progress_callback=None,
+        source_functions=None,
+        security_functions=None,
     ):
-        if self._graph is not None:
-            self._annotate_configured_source_functions(
-                self._graph,
-                source_functions,
-                progress_callback=progress_callback,
-            )
-            self._annotate_configured_security_functions(
-                self._graph,
-                security_functions,
-                progress_callback=progress_callback,
-            )
-            return self._graph
-
-        self._graph = self.build_graph(progress_callback=progress_callback)
-        self._annotate_configured_source_functions(
-            self._graph,
+        progress_callback, source_functions, security_functions = self._graph_options(
+            options,
+            progress_callback,
             source_functions,
-            progress_callback=progress_callback,
-        )
-        self._annotate_configured_security_functions(
-            self._graph,
             security_functions,
-            progress_callback=progress_callback,
         )
-        return self._graph
+        key, source_specs, security_specs = self._annotation_specs(
+            source_functions,
+            security_functions,
+        )
+        with self._lock:
+            if self._base_graph is None:
+                self._base_graph = self.build_graph(
+                    files=files,
+                    progress_callback=progress_callback,
+                )
+            graph = self._graphs.get(key)
+            if graph is None:
+                graph = self._base_graph.copy()
+                self._annotate_configured_functions(
+                    graph,
+                    source_specs,
+                    security_specs,
+                    progress_callback,
+                )
+                self._graphs[key] = graph
+            return graph
 
     def get_codebase_graph_and_paths(
         self,
         *,
+        files=None,
+        options=None,
         max_path_length=DEFAULT_REACHABILITY_MAX_PATH_LENGTH,
         progress_callback=None,
         source_functions=None,
         security_functions=None,
     ):
-        """Return the cached codebase graph and traced paths for shared analysis."""
+        progress_callback, source_functions, security_functions = self._graph_options(
+            options,
+            progress_callback,
+            source_functions,
+            security_functions,
+        )
+        if options is not None:
+            max_path_length = options.max_path_length
         max_path_length = int(max_path_length or DEFAULT_REACHABILITY_MAX_PATH_LENGTH)
-        if self._graph is not None:
-            self._annotate_configured_source_functions(
-                self._graph,
-                source_functions,
-                progress_callback=progress_callback,
-            )
-            self._annotate_configured_security_functions(
-                self._graph,
-                security_functions,
-                progress_callback=progress_callback,
-            )
-        if (
-            self._graph is not None
-            and self._paths is not None
-            and self._paths_max_length == max_path_length
-        ):
-            return self._graph, list(self._paths)
-
         graph = self.ensure_graph(
+            files=files,
+            options=options,
             progress_callback=progress_callback,
             source_functions=source_functions,
             security_functions=security_functions,
         )
-        paths = SourceRootedPathTracer(
-            graph, max_path_length=max_path_length
-        ).find_all_paths()
-        self._paths = list(paths)
-        self._paths_max_length = max_path_length
-        return graph, list(paths)
+        annotation_key, _source_specs, _security_specs = self._annotation_specs(
+            source_functions,
+            security_functions,
+        )
+        path_key = (annotation_key, max_path_length)
+        with self._lock:
+            if path_key in self._paths:
+                return graph, list(self._paths[path_key])
+            paths = SourceRootedPathTracer(
+                graph, max_path_length=max_path_length
+            ).find_all_paths()
+            self._paths[path_key] = list(paths)
+            return graph, list(paths)
 
-    def _c_family_files(self, files) -> list[str]:
-        return [
-            str(path)
-            for path in files
-            if is_c_family_plugin(self._repository.get_plugin_for_path(str(path)))
-        ]
+    def _graph_options(
+        self,
+        options,
+        progress_callback,
+        source_functions,
+        security_functions,
+    ):
+        if options is None:
+            return progress_callback, source_functions, security_functions
+        return (
+            options.progress_callback,
+            options.source_functions,
+            options.security_functions,
+        )
+
+    def _annotation_specs(self, source_functions, security_functions):
+        source_specs = _normalise_source_function_specs(source_functions)
+        security_specs = _normalise_security_function_specs(security_functions)
+        key = (
+            self._spec_cache_key(source_specs),
+            self._spec_cache_key(security_specs),
+        )
+        return key, source_specs, security_specs
+
+    def _spec_cache_key(self, specs):
+        return tuple(
+            (name, tuple(sorted(values.items())))
+            for name, values in sorted(specs.items())
+        )
+
+    def _annotate_configured_functions(
+        self, graph, source_specs, security_specs, progress_callback
+    ):
+        self._annotate_configured_source_functions(
+            graph, source_specs, progress_callback=progress_callback
+        )
+        self._annotate_configured_security_functions(
+            graph, security_specs, progress_callback=progress_callback
+        )
+
+    def _reachability_files(self, files) -> list[str]:
+        return [str(path) for path in files if self._supports_reachability_file(path)]
+
+    def _supports_reachability_file(self, path) -> bool:
+        plugin = self._repository.get_plugin_for_path(str(path))
+        supports = getattr(plugin, "supports_reachability_review", None)
+        return bool(callable(supports) and supports())
 
     def _annotate_configured_source_functions(
-        self, graph, source_functions, *, progress_callback=None
+        self, graph, specs, *, progress_callback=None
     ):
-        specs = _normalise_source_function_specs(source_functions)
         if not specs:
             return 0
         updated = 0
@@ -132,17 +179,16 @@ class ReachabilityGraphCache:
             node.source_reason = f"configured source function: {spec['reason']}"
 
         if updated:
-            self._invalidate_paths()
-            if progress_callback:
-                progress_callback(
-                    {"event": "configured_source_functions_done", "sources": updated}
-                )
+            _emit_progress(
+                progress_callback,
+                Progress.CONFIGURED_SOURCE_FUNCTIONS_DONE,
+                sources=updated,
+            )
         return updated
 
     def _annotate_configured_security_functions(
-        self, graph, security_functions, *, progress_callback=None
+        self, graph, specs, *, progress_callback=None
     ):
-        specs = _normalise_security_function_specs(security_functions)
         if not specs:
             return 0
         updated = 0
@@ -166,16 +212,12 @@ class ReachabilityGraphCache:
             updated += 1
 
         if updated:
-            self._invalidate_paths()
-            if progress_callback:
-                progress_callback(
-                    {"event": "configured_security_functions_done", "sinks": updated}
-                )
+            _emit_progress(
+                progress_callback,
+                Progress.CONFIGURED_SECURITY_FUNCTIONS_DONE,
+                sinks=updated,
+            )
         return updated
-
-    def _invalidate_paths(self):
-        self._paths = None
-        self._paths_max_length = None
 
     def _build_graph_from_files(
         self, files, codebase_path: str, *, progress_callback=None
@@ -184,8 +226,7 @@ class ReachabilityGraphCache:
         files = sorted(str(file) for file in files)
         total = len(files)
         errors: list[str] = []
-        if progress_callback:
-            progress_callback({"event": "treesitter_graph_start", "total": total})
+        _emit_progress(progress_callback, Progress.TREESITTER_GRAPH_START, total=total)
 
         for completed, file_path in enumerate(files, start=1):
             parsed = self._extractor.parse_file(
@@ -197,33 +238,29 @@ class ReachabilityGraphCache:
                 graph.add_node(node)
             for global_construct in parsed.globals:
                 graph.add_global(global_construct)
-            if progress_callback:
-                progress_callback(
-                    {
-                        "event": "treesitter_graph_progress",
-                        "completed": completed,
-                        "total": total,
-                        "file": file_path,
-                        "functions": len(parsed.nodes),
-                        "globals": len(parsed.globals),
-                        "errors": len(parsed.errors),
-                        "error_messages": parsed.errors[:3],
-                    }
-                )
+            _emit_progress(
+                progress_callback,
+                Progress.TREESITTER_GRAPH_PROGRESS,
+                completed=completed,
+                total=total,
+                file=file_path,
+                functions=len(parsed.nodes),
+                globals=len(parsed.globals),
+                errors=len(parsed.errors),
+                error_messages=parsed.errors[:3],
+            )
 
         graph.resolve_all_calls()
         graph.annotate_automatic_sources()
         graph.annotate_external_call_sinks(external_sink_type)
-        if progress_callback:
-            progress_callback(
-                {
-                    "event": "treesitter_graph_done",
-                    "nodes": graph.node_count(),
-                    "edges": graph.edge_count(),
-                    "sources": len(graph.get_sources()),
-                    "sinks": len(graph.get_sinks()),
-                    "globals": len(graph.get_globals()),
-                    "errors": errors,
-                }
-            )
+        _emit_progress(
+            progress_callback,
+            Progress.TREESITTER_GRAPH_DONE,
+            nodes=graph.node_count(),
+            edges=graph.edge_count(),
+            sources=len(graph.get_sources()),
+            sinks=len(graph.get_sinks()),
+            globals=len(graph.get_globals()),
+            errors=errors,
+        )
         return graph

@@ -17,7 +17,7 @@ def _node_text(node, source: bytes) -> str:
 
 
 def _node_kind(node) -> str:
-    return node.kind() or ""
+    return str(node.kind() or "")
 
 
 def _node_children(node) -> list[Any]:
@@ -80,7 +80,7 @@ class _FunctionInfo:
     name: str
     line_start: int
     line_end: int
-    node: Any
+    signature: str
     calls: list[_Reference]
     checks: list[_FlowHop]
 

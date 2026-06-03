@@ -163,7 +163,7 @@ class CFamilyAstMixin:
                     name=name,
                     line_start=line_start,
                     line_end=_node_end_line(node),
-                    node=node,
+                    signature=self._read_signature(node, source),
                     calls=sorted(
                         calls, key=lambda item: (item.line, item.symbol.lower())
                     ),
