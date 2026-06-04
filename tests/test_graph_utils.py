@@ -62,6 +62,8 @@ def test_build_review_system_prompt_includes_threat_model_guidance():
     assert "Project Threat Model" in prompt
     assert "Public API output pointers are in scope." in prompt
     assert "generic caller misuse" in prompt
+    assert "Actively specialize the review" in prompt
+    assert "different concrete root cause" in prompt
 
 
 def test_build_review_system_prompt_preserves_legacy_context_prompt():

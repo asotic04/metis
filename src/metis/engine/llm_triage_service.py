@@ -13,7 +13,10 @@ from typing import Any
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from metis.engine.helpers import format_threat_model_guidance
+from metis.engine.helpers import (
+    extract_threat_model_keywords,
+    format_threat_model_guidance,
+)
 from metis.utils import parse_json_output
 
 from .reachability.source_context import _read_line_context, _read_named_function_body
@@ -93,6 +96,13 @@ security scope. Findings that match attacker capabilities, APIs, data flows, or
 weakness classes named in the threat model are in scope and should not be filtered
 merely because they look like generic caller misuse, path handling, reliability, or
 low-priority hardening in a generic library. Still require concrete code evidence.
+When a threat model is supplied, perform a second recovery pass before returning
+zero kept findings for a batch: if the input finding is wrong or vague but the
+provided code context or repo search evidence exposes a different concrete
+threat-model-in-scope root cause in the same function, neighboring path, or
+same lifecycle/state machine, add that exact issue under additional_findings.
+Do not keep a wrong finding just because its theme is close; either keep the
+precise root cause or filter it as p5. Do not add speculative findings.
 
 Metis default priority rubric:
 - p0: emergency response. Reserve this for an issue that can take down the service,
@@ -169,7 +179,9 @@ Output schema:
 
 Only add additional_findings when the provided code context or repo search evidence directly
 supports a real security issue not already represented by an input finding. Do not speculate
-from names alone.
+from names alone. When a threat model is supplied, actively check whether a filtered or
+near-miss input finding reveals a different concrete in-scope bug in the shown evidence,
+then add that exact root cause as an additional finding instead of returning no signal.
 
 {threat_model}
 
@@ -203,6 +215,10 @@ class LlmTriageService:
         self._llm_provider = llm_provider
         self._usage_runtime = usage_runtime
         self._threat_model_text = str(threat_model_text or "").strip()
+        self._threat_model_keywords = extract_threat_model_keywords(
+            self._threat_model_text,
+            limit=40,
+        )
 
     def triage_review_results(
         self,
@@ -542,6 +558,12 @@ class LlmTriageService:
 
     def _repo_search_evidence(self, issue: dict[str, Any]) -> list[dict[str, Any]]:
         queries = _search_queries_for_issue(issue)
+        queries.extend(
+            _threat_model_search_queries_for_issue(
+                issue,
+                self._threat_model_keywords,
+            )
+        )
         if not queries:
             return []
         return _search_codebase(
@@ -1730,6 +1752,33 @@ def _search_queries_for_issue(issue: dict[str, Any]) -> list[str]:
             break
 
     return candidates[:10]
+
+
+def _threat_model_search_queries_for_issue(
+    issue: dict[str, Any],
+    threat_model_keywords: list[str],
+) -> list[str]:
+    if not threat_model_keywords:
+        return []
+    issue_text = _issue_text(issue).lower()
+    selected: list[str] = []
+    for keyword in threat_model_keywords:
+        text = str(keyword or "").strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if lowered.startswith("cwe-"):
+            continue
+        code_like = "_" in text or "->" in text or lowered.startswith(("kbase", "gpu"))
+        if not code_like:
+            continue
+        if lowered not in issue_text and len(selected) >= 3:
+            continue
+        if text not in selected:
+            selected.append(text)
+        if len(selected) >= 6:
+            break
+    return selected
 
 
 def _search_codebase(

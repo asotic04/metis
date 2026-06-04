@@ -13,6 +13,7 @@ from metis.usage import UsageRuntime
 from metis.vector_store.base import BaseVectorStore
 
 from .graphs import AskGraph, ReviewGraph
+from .helpers import extract_threat_model_keywords
 from .indexing_service import IndexingService
 from .llm_triage_service import LlmTriageService
 from .options import TriageOptions, coerce_triage_options
@@ -164,16 +165,21 @@ class MetisEngine:
         if not self.threat_model_text:
             return
         domain_hints = list(self.reachability_settings.get("domain_hints") or [])
+        keywords = extract_threat_model_keywords(
+            self.threat_model_text,
+            self.threat_model_keywords,
+        )
         hint = {
             "notes": [
                 (
                     "Threat model guidance applies to this review. Treat named "
-                    "attacker capabilities, APIs, data flows, and vulnerability "
-                    "classes as in-scope security concerns:\n"
+                    "attacker capabilities, APIs, data flows, state machines, "
+                    "resource lifetimes, and vulnerability classes as active "
+                    "review focus areas:\n"
                     f"{self.threat_model_text}"
                 )
             ],
-            "keywords": list(self.threat_model_keywords),
+            "keywords": keywords,
         }
         domain_hints.append(hint)
         self.reachability_settings["domain_hints"] = domain_hints

@@ -18,6 +18,8 @@ def test_llm_triage_prompt_uses_metis_priority_rubric():
     assert "p2: normal security priority" in prompt
     assert "default for kept" in prompt
     assert "p5: Metis-only filtered state" in prompt
+    assert "second recovery pass" in prompt
+    assert "additional_findings" in prompt
 
 
 def test_llm_triage_filters_p5_and_sorts_priorities(monkeypatch, tmp_path):
@@ -188,6 +190,7 @@ int png_image_write_to_memory(size_t *memory_bytes) {
     )
 
     assert "Public API output pointers" in calls[0]["variables"]["threat_model"]
+    assert "different concrete root cause" in calls[0]["variables"]["threat_model"]
     assert payload["summary"]["threat_model_provided"] is True
     assert payload["issues"][0]["priority"] == "p3"
 

@@ -12,6 +12,12 @@ _GPU_KEYWORDS = tuple(
     cpu_wr ctx ctx_count ctx->regions ctx.lock region regions region_count
     region->pages alias alias_count mmu mmu.lock mmio dma firmware fw_name ioctl
     sysfs debugfs doorbell irq watchdog
+    mali kbase kctx kcpu csf jit vm_region va_region mem_pool mem_pools
+    get_user_pages_fast copy_to_user fd_install dma_fence dma_fence_put
+    queue workqueue work timer cancel flush drain suspend resume reclaim
+    page_usage page_count nr_pages gpu_alloc cpu_alloc map unmap mmap zap
+    tlb cache l2 power reset fault tagged physical pages refcount lock
+    hwaccess_lock group_suspend sync_wait sync32 sync64
     """.split()
 )
 
@@ -26,6 +32,10 @@ _GPU_PROFILE = {
         "Lifecycle/accounting: gpu_mappings, alias_count, region_count, ctx_count, "
         "get/put, map/unmap, create/destroy, and watchdog callbacks may indicate "
         "ownership or teardown bugs.",
+        "Kernel GPU/Mali-style code: kbase/kctx/kcpu/csf/JIT queues, workqueues, "
+        "GUP pins, fd/fence lifetime, page/accounting symmetry, VM region teardown, "
+        "MMU/TLB/cache/power ordering, and firmware-reported shared-memory pointers "
+        "are security-sensitive when user or firmware state can influence them.",
         "Memory/resource ownership: region->pages, alias pages, MMU mappings, and "
         "firmware paths are benchmark-specific hints, not generic assumptions.",
     ),
@@ -56,7 +66,15 @@ def format_domain_hints_for_prompt(hints):
     keywords = tuple((hints or {}).get("keywords") or ())
     if not notes and not keywords:
         return ""
-    lines = ["User-provided domain hints:"]
+    lines = ["User-provided domain/threat-model focus hints:"]
+    lines.append(
+        "- Treat these hints as active focus lenses for candidate selection and prompt "
+        "analysis; they are not proof by themselves."
+    )
+    lines.append(
+        "- If a hinted mechanism appears in the shown code, inspect neighboring state, "
+        "lifetime, lock, accounting, and boundary checks for a concrete root cause."
+    )
     lines.extend(f"- {note}" for note in notes)
     if keywords:
         lines.append("- Relevant domain keywords: " + ", ".join(keywords[:80]))

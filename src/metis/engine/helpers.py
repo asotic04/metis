@@ -3,11 +3,122 @@
 
 import logging
 import os
+import re
 
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
 logger = logging.getLogger("metis")
+
+_THREAT_MODEL_TOKEN_RE = re.compile(
+    r"CWE-\d+|[A-Za-z_][A-Za-z0-9_]*(?:->[A-Za-z_][A-Za-z0-9_]*)?",
+    re.IGNORECASE,
+)
+
+_THREAT_MODEL_KEYWORD_STOPWORDS = {
+    "ability",
+    "able",
+    "about",
+    "across",
+    "actual",
+    "add",
+    "against",
+    "all",
+    "also",
+    "and",
+    "any",
+    "api",
+    "are",
+    "around",
+    "attacker",
+    "based",
+    "because",
+    "before",
+    "being",
+    "bug",
+    "bugs",
+    "caller",
+    "calls",
+    "can",
+    "capabilities",
+    "capability",
+    "case",
+    "check",
+    "code",
+    "concrete",
+    "context",
+    "control",
+    "could",
+    "data",
+    "direct",
+    "directly",
+    "does",
+    "during",
+    "each",
+    "evidence",
+    "exact",
+    "file",
+    "finding",
+    "findings",
+    "flow",
+    "flows",
+    "focus",
+    "for",
+    "from",
+    "generic",
+    "have",
+    "impact",
+    "include",
+    "including",
+    "input",
+    "into",
+    "issue",
+    "issues",
+    "keep",
+    "likely",
+    "local",
+    "may",
+    "missing",
+    "model",
+    "must",
+    "named",
+    "not",
+    "only",
+    "path",
+    "paths",
+    "pay",
+    "project",
+    "provided",
+    "real",
+    "report",
+    "reported",
+    "require",
+    "scope",
+    "security",
+    "should",
+    "shown",
+    "special",
+    "state",
+    "still",
+    "supported",
+    "that",
+    "the",
+    "their",
+    "these",
+    "this",
+    "threat",
+    "through",
+    "treat",
+    "under",
+    "use",
+    "used",
+    "user",
+    "when",
+    "where",
+    "with",
+    "within",
+    "would",
+}
 
 
 def summarize_changes(llm_provider, file_path, issues, summary_prompt, callbacks=None):
@@ -82,6 +193,53 @@ def apply_custom_guidance(base_prompt, custom_guidance, precedence_note):
     return f"{guidance_block}\n\n{base_prompt}"
 
 
+def extract_threat_model_keywords(
+    threat_model_text,
+    explicit_keywords=None,
+    *,
+    limit=120,
+):
+    """Return ordered domain keywords derived from threat-model text and config.
+
+    These keywords are used only as candidate-selection and prompt-focus hints. They
+    are intentionally broad enough to capture function names, struct fields, CWE IDs,
+    and domain terms from inline benchmark threat models, while dropping prose words
+    that would make every function look relevant.
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(value):
+        text = str(value or "").strip().strip("`'\".,;:()[]{}")
+        if not text:
+            return
+        key = text.lower()
+        if key in seen or key in _THREAT_MODEL_KEYWORD_STOPWORDS:
+            return
+        if len(key) < 4 and not key.startswith("cwe-"):
+            return
+        ordered.append(text)
+        seen.add(key)
+
+    for keyword in explicit_keywords or ():
+        add(keyword)
+
+    for token in _THREAT_MODEL_TOKEN_RE.findall(str(threat_model_text or "")):
+        lowered = token.lower()
+        if (
+            "_" not in token
+            and "->" not in token
+            and not lowered.startswith("cwe-")
+            and len(token) < 7
+        ):
+            continue
+        add(token)
+        if len(ordered) >= limit:
+            break
+
+    return ordered[:limit]
+
+
 def format_threat_model_guidance(threat_model_text):
     text = str(threat_model_text or "").strip()
     if not text:
@@ -91,11 +249,18 @@ def format_threat_model_guidance(threat_model_text):
         f"{text}\n\n"
         "Threat-model handling rules:\n"
         "- Treat this threat model as authoritative project-specific security scope.\n"
-        "- Pay special attention to issue classes, data flows, APIs, and attacker "
-        "capabilities named in the threat model.\n"
+        "- Actively specialize the review toward issue classes, data flows, APIs, "
+        "state machines, resource lifetimes, and attacker capabilities named in "
+        "the threat model.\n"
         "- Findings inside this threat model are in scope even when they would "
         "otherwise look like generic caller misuse, path handling, reliability, "
         "or low-priority hardening.\n"
+        "- If the direct reported issue is not quite right but the shown code or "
+        "path evidence exposes a different concrete root cause inside the threat "
+        "model, report the exact root cause rather than discarding the signal.\n"
+        "- Use threat-model terms as focus lenses for neighboring functions, "
+        "publish/teardown ordering, lock/refcount/accounting symmetry, and shared "
+        "state transitions when those mechanisms are named.\n"
         "- Still require concrete code evidence and do not invent findings not "
         "supported by the provided code."
     )

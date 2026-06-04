@@ -13,6 +13,11 @@ cwe must be the best matching CWE ID you infer from the issue, such as CWE-120;
 leave it empty only when no CWE is known.
 confidence must be exactly one of: high, medium, low.
 Return an empty findings list when the evidence does not prove a vulnerability.
+When user-provided domain/threat-model focus hints are present, use them to
+actively inspect the shown code for the named mechanisms and adjacent root
+causes. A focus hint increases scrutiny, but it is not proof: still return an
+empty findings list when the code evidence does not show a concrete security
+bug.
 """
 
 
@@ -47,6 +52,9 @@ Look for:
 11. MISSING BOUNDS CHECK: memcpy/sprintf/strncpy with size from parameter without validation.
 12. STATE ORDERING: Setting ready/enabled flag BEFORE prerequisite validation/initialization completes.
 13. STALE METADATA: Modifying buffer content without updating associated length/size field.
+14. THREAT-MODEL FOCUS: When domain/threat-model hints name project-specific
+   mechanisms, inspect those mechanisms and directly related neighbors for
+   concrete bugs even if they are not classic C sinks.
 """,
     """\
 Return no findings if none are proven. Be thorough but report each distinct bug only ONCE.""",
