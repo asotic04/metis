@@ -21,6 +21,7 @@ def test_llm_triage_prompt_uses_metis_priority_rubric():
     assert "second recovery pass" in prompt
     assert "additional_findings" in prompt
     assert "repo_search_requests" in llm_triage_service._TRIAGE_USER_PROMPT
+    assert "repo_search_insights" in llm_triage_service._TRIAGE_USER_PROMPT
     assert "exact function names" in llm_triage_service._TRIAGE_USER_PROMPT
 
 
@@ -757,7 +758,15 @@ int entry_ioctl(int cmd) {
                         "reason": "Search evidence shows the reported path is ioctl reachable.",
                         "exploitability": "Attacker controls cmd through entry_ioctl.",
                     }
-                ]
+                ],
+                "repo_search_insights": [
+                    {
+                        "query": "entry_ioctl",
+                        "finding_ids": ["F001"],
+                        "insight": "entry_ioctl is present under product/kernel and reaches risky_dispatch.",
+                        "impact": "supports_reachability",
+                    }
+                ],
             }
         )
 
@@ -794,6 +803,36 @@ int entry_ioctl(int cmd) {
     assert payload["summary"]["dynamic_repo_search_rounds"] == 1
     assert payload["summary"]["dynamic_repo_search_requests"] == 1
     assert payload["summary"]["dynamic_repo_search_matches"] == 1
+    assert payload["summary"]["dynamic_repo_search_insights"] == 1
+    assert payload["dynamic_repo_checks"] == [
+        {
+            "batch": 1,
+            "round": 1,
+            "query": "entry_ioctl",
+            "path_prefix": "product/kernel",
+            "reason": "Find the ioctl entry path.",
+            "finding_ids": ["F001"],
+            "match_count": 1,
+            "truncated": False,
+            "matches": [
+                {
+                    "file": "product/kernel/entry.c",
+                    "line_number": 1,
+                    "line": "int entry_ioctl(int cmd) {",
+                }
+            ],
+        }
+    ]
+    assert payload["dynamic_repo_insights"] == [
+        {
+            "query": "entry_ioctl",
+            "finding_ids": ["F001"],
+            "insight": "entry_ioctl is present under product/kernel and reaches risky_dispatch.",
+            "impact": "supports_reachability",
+            "batch": 1,
+            "round": 1,
+        }
+    ]
     assert payload["issues"][0]["id"] == "F001"
     assert payload["issues"][0]["priority"] == "p2"
 

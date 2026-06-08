@@ -194,6 +194,14 @@ Output schema:
       "path_prefix": "optional/repo/subdir",
       "finding_ids": ["F001"]
     }}
+  ],
+  "repo_search_insights": [
+    {{
+      "query": "exact_symbol_or_string_that_was_searched",
+      "finding_ids": ["F001"],
+      "insight": "What the retrieved evidence proved or ruled out.",
+      "impact": "supports_reachability | refutes_reachability | supports_filtering | supports_additional_finding | inconclusive"
+    }}
   ]
 }}
 
@@ -203,6 +211,9 @@ per round. Prefer exact function names, type names, struct fields, constants, an
 distinctive strings. Do not ask for generic searches. If Dynamic repo evidence below
 already answers the question, return decisions and additional_findings without more
 searches.
+When Dynamic repo evidence affects a keep/filter/additional finding decision, include
+repo_search_insights that concisely state what the retrieved evidence proved or ruled
+out. If the search did not help, say it was inconclusive.
 
 Only add additional_findings when the provided code context or repo search evidence directly
 supports a real security issue not already represented by an input finding. Do not speculate
@@ -320,6 +331,8 @@ class LlmTriageService:
         dynamic_search_rounds = 0
         dynamic_search_requests = 0
         dynamic_search_matches = 0
+        dynamic_repo_checks: list[dict[str, Any]] = []
+        dynamic_repo_insights: list[dict[str, Any]] = []
 
         _emit_progress(
             progress_callback,
@@ -346,7 +359,7 @@ class LlmTriageService:
             )
             prompt_succeeded = False
             try:
-                decisions, additions, search_metrics = (
+                decisions, additions, search_metrics, search_checks, search_insights = (
                     self._triage_batch_with_dynamic_search(
                         batch,
                         batch_index=batch_index,
@@ -362,6 +375,8 @@ class LlmTriageService:
                 dynamic_search_rounds += search_metrics["rounds"]
                 dynamic_search_requests += search_metrics["requests"]
                 dynamic_search_matches += search_metrics["matches"]
+                dynamic_repo_checks.extend(search_checks)
+                dynamic_repo_insights.extend(search_insights)
                 prompt_succeeded = True
             except Exception as exc:  # pragma: no cover
                 phase, attempts = _exception_phase_and_attempts(exc, "batch_invoke")
@@ -391,7 +406,13 @@ class LlmTriageService:
                     for retry_batch in _chunk_findings(omitted, retry_batch_size):
                         retry_ids = [finding.id for finding in retry_batch]
                         try:
-                            retry_decisions, retry_additions, retry_search_metrics = (
+                            (
+                                retry_decisions,
+                                retry_additions,
+                                retry_search_metrics,
+                                retry_search_checks,
+                                retry_search_insights,
+                            ) = (
                                 self._triage_batch_with_dynamic_search(
                                     retry_batch,
                                     batch_index=batch_index,
@@ -408,6 +429,8 @@ class LlmTriageService:
                             dynamic_search_rounds += retry_search_metrics["rounds"]
                             dynamic_search_requests += retry_search_metrics["requests"]
                             dynamic_search_matches += retry_search_metrics["matches"]
+                            dynamic_repo_checks.extend(retry_search_checks)
+                            dynamic_repo_insights.extend(retry_search_insights)
                         except Exception as exc:  # pragma: no cover
                             phase, attempts = _exception_phase_and_attempts(
                                 exc, "omitted_retry_invoke"
@@ -473,6 +496,8 @@ class LlmTriageService:
                 dynamic_search_rounds=dynamic_search_rounds,
                 dynamic_search_requests=dynamic_search_requests,
                 dynamic_search_matches=dynamic_search_matches,
+                dynamic_repo_checks=dynamic_repo_checks,
+                dynamic_repo_insights=dynamic_repo_insights,
             )
         except Exception as exc:
             return _failure_payload_from_findings(
@@ -635,8 +660,16 @@ class LlmTriageService:
         reasoning_effort: str,
         progress_callback,
         errors: list[dict[str, Any]],
-    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, int],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         dynamic_evidence: list[dict[str, Any]] = []
+        dynamic_checks: list[dict[str, Any]] = []
+        dynamic_insights: list[dict[str, Any]] = []
         seen_searches: set[tuple[str, str]] = set()
         total_requests = 0
         total_matches = 0
@@ -666,7 +699,16 @@ class LlmTriageService:
                 reasoning_effort=reasoning_effort,
                 temperature=0.0,
             )
-            decisions, additions, search_requests = _parse_triage_response(raw, batch)
+            decisions, additions, search_requests, search_insights = (
+                _parse_triage_response(raw, batch)
+            )
+            dynamic_insights.extend(
+                _annotate_dynamic_repo_insights(
+                    search_insights,
+                    batch=batch_index,
+                    round_index=round_index,
+                )
+            )
 
             if (
                 not search_requests
@@ -677,7 +719,7 @@ class LlmTriageService:
                     "rounds": rounds_used,
                     "requests": total_requests,
                     "matches": total_matches,
-                }
+                }, dynamic_checks, dynamic_insights
 
             remaining_matches = (
                 DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_TOTAL_MATCHES - total_matches
@@ -692,10 +734,17 @@ class LlmTriageService:
                     "rounds": rounds_used,
                     "requests": total_requests,
                     "matches": total_matches,
-                }
+                }, dynamic_checks, dynamic_insights
 
             dynamic_evidence.extend(evidence)
             rounds_used += 1
+            dynamic_checks.extend(
+                _dynamic_repo_checks_for_report(
+                    evidence,
+                    batch=batch_index,
+                    round_index=rounds_used,
+                )
+            )
             total_requests += len(evidence)
             total_matches += sum(len(item.get("matches") or []) for item in evidence)
             _emit_progress(
@@ -715,7 +764,7 @@ class LlmTriageService:
             "rounds": rounds_used,
             "requests": total_requests,
             "matches": total_matches,
-        }
+        }, dynamic_checks, dynamic_insights
 
     def _execute_dynamic_repo_searches(
         self,
@@ -782,6 +831,8 @@ class LlmTriageService:
         dynamic_search_rounds: int = 0,
         dynamic_search_requests: int = 0,
         dynamic_search_matches: int = 0,
+        dynamic_repo_checks: list[dict[str, Any]] | None = None,
+        dynamic_repo_insights: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         kept = []
         filtered = []
@@ -899,10 +950,13 @@ class LlmTriageService:
                 "dynamic_repo_search_rounds": dynamic_search_rounds,
                 "dynamic_repo_search_requests": dynamic_search_requests,
                 "dynamic_repo_search_matches": dynamic_search_matches,
+                "dynamic_repo_search_insights": len(dynamic_repo_insights or []),
                 "errors": errors,
             },
             "issues": kept,
             "filtered_issues": filtered,
+            "dynamic_repo_checks": list(dynamic_repo_checks or []),
+            "dynamic_repo_insights": list(dynamic_repo_insights or []),
         }
 
 
@@ -1055,7 +1109,12 @@ def _triage_chat_model_kwargs(usage_runtime, *, reasoning_effort=None) -> dict[s
 
 def _parse_triage_response(
     raw: Any, batch: list[_FindingRecord]
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    dict[str, dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     if hasattr(raw, "model_dump"):
         parsed = raw.model_dump()
     elif isinstance(raw, dict):
@@ -1063,7 +1122,7 @@ def _parse_triage_response(
     else:
         parsed = parse_json_output(raw)
     if not isinstance(parsed, dict):
-        return {}, [], []
+        return {}, [], [], []
     decisions = parsed.get("decisions")
     if not isinstance(decisions, list):
         decisions = []
@@ -1089,7 +1148,8 @@ def _parse_triage_response(
         }
     additions = _parse_additional_findings(parsed.get("additional_findings"))
     search_requests = _parse_repo_search_requests(parsed.get("repo_search_requests"))
-    return normalized, additions, search_requests
+    search_insights = _parse_repo_search_insights(parsed.get("repo_search_insights"))
+    return normalized, additions, search_requests, search_insights
 
 
 def _parse_repo_search_requests(raw_items) -> list[dict[str, Any]]:
@@ -1101,6 +1161,46 @@ def _parse_repo_search_requests(raw_items) -> list[dict[str, Any]]:
         if cleaned is not None:
             requests.append(cleaned)
     return requests
+
+
+def _parse_repo_search_insights(raw_items) -> list[dict[str, Any]]:
+    if not isinstance(raw_items, list):
+        return []
+    insights: list[dict[str, Any]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        insight = str(item.get("insight") or item.get("summary") or "").strip()
+        if not insight:
+            continue
+        query = str(item.get("query") or "").strip()[:120]
+        impact = str(item.get("impact") or "").strip().lower()
+        if impact not in {
+            "supports_reachability",
+            "refutes_reachability",
+            "supports_filtering",
+            "supports_additional_finding",
+            "inconclusive",
+        }:
+            impact = "inconclusive"
+        raw_ids = item.get("finding_ids") or item.get("ids") or []
+        if isinstance(raw_ids, str):
+            raw_ids = [raw_ids]
+        finding_ids = []
+        if isinstance(raw_ids, (list, tuple, set)):
+            for finding_id in raw_ids[:8]:
+                text = str(finding_id or "").strip()
+                if re.fullmatch(r"[FA]\d{3}", text):
+                    finding_ids.append(text)
+        insights.append(
+            {
+                "query": query,
+                "finding_ids": finding_ids,
+                "insight": insight[:600],
+                "impact": impact,
+            }
+        )
+    return insights
 
 
 def _parse_additional_findings(raw_items) -> list[dict[str, Any]]:
@@ -1997,6 +2097,54 @@ def _dynamic_repo_evidence_json(evidence: list[dict[str, Any]]) -> str:
     if not evidence:
         return "[]"
     return json.dumps(evidence, indent=2)
+
+
+def _dynamic_repo_checks_for_report(
+    evidence: list[dict[str, Any]],
+    *,
+    batch: int,
+    round_index: int,
+) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    for item in evidence:
+        matches = item.get("matches") or []
+        checks.append(
+            {
+                "batch": batch,
+                "round": round_index,
+                "query": str(item.get("query") or ""),
+                "path_prefix": item.get("path_prefix"),
+                "reason": str(item.get("reason") or ""),
+                "finding_ids": list(item.get("finding_ids") or []),
+                "match_count": len(matches),
+                "truncated": bool(item.get("truncated")),
+                "matches": [
+                    {
+                        "file": match.get("file"),
+                        "line_number": match.get("line_number"),
+                        "line": match.get("line"),
+                    }
+                    for match in matches[:8]
+                    if isinstance(match, dict)
+                ],
+            }
+        )
+    return checks
+
+
+def _annotate_dynamic_repo_insights(
+    insights: list[dict[str, Any]],
+    *,
+    batch: int,
+    round_index: int,
+) -> list[dict[str, Any]]:
+    annotated: list[dict[str, Any]] = []
+    for insight in insights:
+        item = copy.deepcopy(insight)
+        item["batch"] = batch
+        item["round"] = round_index
+        annotated.append(item)
+    return annotated
 
 
 def _clean_dynamic_search_request(item: Any) -> dict[str, Any] | None:
