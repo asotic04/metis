@@ -28,6 +28,12 @@ DEFAULT_LLM_TRIAGE_MAX_TOKENS = 12000
 DEFAULT_LLM_TRIAGE_MAX_SEARCH_MATCHES = 24
 DEFAULT_LLM_TRIAGE_MAX_ATTEMPTS = 3
 DEFAULT_LLM_TRIAGE_RETRY_BASE_DELAY_SECONDS = 1.5
+DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_ROUNDS = 2
+DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_REQUESTS_PER_ROUND = 4
+DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_MATCHES_PER_REQUEST = 8
+DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_TOTAL_MATCHES = 32
+DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_CONTEXT_LINES = 3
+DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_CONTEXT_CHARS = 1200
 
 _PRIORITY_RANK = {"p0": 0, "p1": 1, "p2": 2, "p3": 3, "p4": 4, "p5": 5}
 _SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -103,6 +109,12 @@ threat-model-in-scope root cause in the same function, neighboring path, or
 same lifecycle/state machine, add that exact issue under additional_findings.
 Do not keep a wrong finding just because its theme is close; either keep the
 precise root cause or filter it as p5. Do not add speculative findings.
+You may request bounded repository searches when the supplied context is insufficient.
+Search requests are for exact identifiers, function names, constants, struct fields,
+or distinctive error strings only. Never request broad generic terms such as "lock",
+"queue", "memory", "user", "error", or a CWE alone. If search results are too broad,
+request a narrower exact symbol or a path_prefix. Once search budget is exhausted,
+return final decisions from the evidence available.
 
 Metis default priority rubric:
 - p0: emergency response. Reserve this for an issue that can take down the service,
@@ -174,8 +186,23 @@ Output schema:
       "reasoning": "Why this is a real issue, tied to provided code/search evidence.",
       "mitigation": "Concrete fix."
     }}
+  ],
+  "repo_search_requests": [
+    {{
+      "query": "exact_symbol_or_string_to_search",
+      "reason": "What missing context this would resolve.",
+      "path_prefix": "optional/repo/subdir",
+      "finding_ids": ["F001"]
+    }}
   ]
 }}
+
+Use repo_search_requests only when more repository evidence is necessary to decide
+exploitability or recover a concrete missed root cause. Request at most four searches
+per round. Prefer exact function names, type names, struct fields, constants, and
+distinctive strings. Do not ask for generic searches. If Dynamic repo evidence below
+already answers the question, return decisions and additional_findings without more
+searches.
 
 Only add additional_findings when the provided code context or repo search evidence directly
 supports a real security issue not already represented by an input finding. Do not speculate
@@ -187,6 +214,12 @@ then add that exact root cause as an additional finding instead of returning no 
 
 Batch:
 {batch_json}
+
+Dynamic repo-search budget and status:
+{dynamic_search_status}
+
+Dynamic repo evidence retrieved so far:
+{dynamic_repo_evidence}
 """
 
 
@@ -284,6 +317,9 @@ class LlmTriageService:
         additional_findings: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         omitted_after_retry = 0
+        dynamic_search_rounds = 0
+        dynamic_search_requests = 0
+        dynamic_search_matches = 0
 
         _emit_progress(
             progress_callback,
@@ -295,22 +331,6 @@ class LlmTriageService:
             },
             errors,
         )
-
-        def _invoke_batch(batch_records: list[_FindingRecord]) -> str:
-            return _invoke_triage_prompt_with_retries(
-                self._llm_provider,
-                self._usage_runtime,
-                model=model,
-                max_tokens=max_tokens,
-                variables={
-                    "batch_json": json.dumps(_batch_payload(batch_records), indent=2),
-                    "threat_model": _triage_threat_model_prompt(
-                        self._threat_model_text
-                    ),
-                },
-                reasoning_effort=reasoning_effort,
-                temperature=0.0,
-            )
 
         for batch_index, batch in enumerate(batches, start=1):
             batch_ids = [finding.id for finding in batch]
@@ -326,9 +346,22 @@ class LlmTriageService:
             )
             prompt_succeeded = False
             try:
-                raw = _invoke_batch(batch)
-                decisions, additions = _parse_triage_response(raw, batch)
+                decisions, additions, search_metrics = (
+                    self._triage_batch_with_dynamic_search(
+                        batch,
+                        batch_index=batch_index,
+                        batch_count=len(batches),
+                        model=model,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        progress_callback=progress_callback,
+                        errors=errors,
+                    )
+                )
                 additional_findings.extend(additions)
+                dynamic_search_rounds += search_metrics["rounds"]
+                dynamic_search_requests += search_metrics["requests"]
+                dynamic_search_matches += search_metrics["matches"]
                 prompt_succeeded = True
             except Exception as exc:  # pragma: no cover
                 phase, attempts = _exception_phase_and_attempts(exc, "batch_invoke")
@@ -358,12 +391,23 @@ class LlmTriageService:
                     for retry_batch in _chunk_findings(omitted, retry_batch_size):
                         retry_ids = [finding.id for finding in retry_batch]
                         try:
-                            raw = _invoke_batch(retry_batch)
-                            retry_decisions, retry_additions = _parse_triage_response(
-                                raw, retry_batch
+                            retry_decisions, retry_additions, retry_search_metrics = (
+                                self._triage_batch_with_dynamic_search(
+                                    retry_batch,
+                                    batch_index=batch_index,
+                                    batch_count=len(batches),
+                                    model=model,
+                                    max_tokens=max_tokens,
+                                    reasoning_effort=reasoning_effort,
+                                    progress_callback=progress_callback,
+                                    errors=errors,
+                                )
                             )
                             decisions.update(retry_decisions)
                             additional_findings.extend(retry_additions)
+                            dynamic_search_rounds += retry_search_metrics["rounds"]
+                            dynamic_search_requests += retry_search_metrics["requests"]
+                            dynamic_search_matches += retry_search_metrics["matches"]
                         except Exception as exc:  # pragma: no cover
                             phase, attempts = _exception_phase_and_attempts(
                                 exc, "omitted_retry_invoke"
@@ -426,6 +470,9 @@ class LlmTriageService:
                 errors=errors,
                 omitted_after_retry=omitted_after_retry,
                 threat_model_provided=bool(self._threat_model_text),
+                dynamic_search_rounds=dynamic_search_rounds,
+                dynamic_search_requests=dynamic_search_requests,
+                dynamic_search_matches=dynamic_search_matches,
             )
         except Exception as exc:
             return _failure_payload_from_findings(
@@ -511,7 +558,9 @@ class LlmTriageService:
                 max_chars=2500,
             )
             if line_context:
-                parts.append(f"Nearby lines:\n{line_context}")
+                parts.append(
+                    f"Nearby lines from {rel_file}:{line_number}:\n{line_context}"
+                )
 
             primary_function = _function_name(issue.get("primary_function"))
             if primary_function:
@@ -523,7 +572,10 @@ class LlmTriageService:
                     max_chars=5000,
                 )
                 if body:
-                    parts.append(f"Primary function body:\n{body}")
+                    parts.append(
+                        f"Primary function body from {rel_file}::{primary_function}:\n"
+                        f"{body}"
+                    )
 
         for path_context in self._path_context(issue, rel_file):
             parts.append(path_context)
@@ -572,6 +624,149 @@ class LlmTriageService:
             max_matches=DEFAULT_LLM_TRIAGE_MAX_SEARCH_MATCHES,
         )
 
+    def _triage_batch_with_dynamic_search(
+        self,
+        batch: list[_FindingRecord],
+        *,
+        batch_index: int,
+        batch_count: int,
+        model: str,
+        max_tokens: int,
+        reasoning_effort: str,
+        progress_callback,
+        errors: list[dict[str, Any]],
+    ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+        dynamic_evidence: list[dict[str, Any]] = []
+        seen_searches: set[tuple[str, str]] = set()
+        total_requests = 0
+        total_matches = 0
+        rounds_used = 0
+
+        for round_index in range(DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_ROUNDS + 1):
+            raw = _invoke_triage_prompt_with_retries(
+                self._llm_provider,
+                self._usage_runtime,
+                model=model,
+                max_tokens=max_tokens,
+                variables={
+                    "batch_json": json.dumps(_batch_payload(batch), indent=2),
+                    "threat_model": _triage_threat_model_prompt(
+                        self._threat_model_text
+                    ),
+                    "dynamic_search_status": _dynamic_search_status(
+                        round_index,
+                        rounds_used,
+                        total_requests,
+                        total_matches,
+                    ),
+                    "dynamic_repo_evidence": _dynamic_repo_evidence_json(
+                        dynamic_evidence
+                    ),
+                },
+                reasoning_effort=reasoning_effort,
+                temperature=0.0,
+            )
+            decisions, additions, search_requests = _parse_triage_response(raw, batch)
+
+            if (
+                not search_requests
+                or round_index >= DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_ROUNDS
+                or total_matches >= DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_TOTAL_MATCHES
+            ):
+                return decisions, additions, {
+                    "rounds": rounds_used,
+                    "requests": total_requests,
+                    "matches": total_matches,
+                }
+
+            remaining_matches = (
+                DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_TOTAL_MATCHES - total_matches
+            )
+            evidence = self._execute_dynamic_repo_searches(
+                search_requests,
+                seen_searches,
+                remaining_matches=remaining_matches,
+            )
+            if not evidence:
+                return decisions, additions, {
+                    "rounds": rounds_used,
+                    "requests": total_requests,
+                    "matches": total_matches,
+                }
+
+            dynamic_evidence.extend(evidence)
+            rounds_used += 1
+            total_requests += len(evidence)
+            total_matches += sum(len(item.get("matches") or []) for item in evidence)
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "llm_triage_repo_search",
+                    "batch": batch_index,
+                    "batches": batch_count,
+                    "round": rounds_used,
+                    "requests": len(evidence),
+                    "matches": sum(len(item.get("matches") or []) for item in evidence),
+                },
+                errors,
+            )
+
+        return decisions, additions, {
+            "rounds": rounds_used,
+            "requests": total_requests,
+            "matches": total_matches,
+        }
+
+    def _execute_dynamic_repo_searches(
+        self,
+        search_requests: list[dict[str, Any]],
+        seen_searches: set[tuple[str, str]],
+        *,
+        remaining_matches: int,
+    ) -> list[dict[str, Any]]:
+        evidence: list[dict[str, Any]] = []
+        remaining_matches = max(0, int(remaining_matches or 0))
+        if remaining_matches <= 0:
+            return evidence
+
+        for request in search_requests[
+            :DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_REQUESTS_PER_ROUND
+        ]:
+            cleaned = _clean_dynamic_search_request(request)
+            if cleaned is None:
+                continue
+            key = (cleaned["query"].lower(), cleaned["path_prefix"].lower())
+            if key in seen_searches:
+                continue
+            seen_searches.add(key)
+
+            max_matches = min(
+                DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_MATCHES_PER_REQUEST,
+                remaining_matches,
+            )
+            matches = _search_codebase_context(
+                self._codebase_path,
+                cleaned["query"],
+                path_prefix=cleaned["path_prefix"],
+                max_matches=max_matches,
+                context_lines=DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_CONTEXT_LINES,
+                max_context_chars=DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_CONTEXT_CHARS,
+            )
+            evidence.append(
+                {
+                    "query": cleaned["query"],
+                    "path_prefix": cleaned["path_prefix"] or None,
+                    "reason": cleaned["reason"],
+                    "finding_ids": cleaned["finding_ids"],
+                    "matches": matches,
+                    "truncated": len(matches) >= max_matches,
+                }
+            )
+            remaining_matches -= len(matches)
+            if remaining_matches <= 0:
+                break
+        return evidence
+
     def _build_payload(
         self,
         findings: list[_FindingRecord],
@@ -584,6 +779,9 @@ class LlmTriageService:
         errors: list[dict[str, Any]],
         omitted_after_retry: int = 0,
         threat_model_provided: bool = False,
+        dynamic_search_rounds: int = 0,
+        dynamic_search_requests: int = 0,
+        dynamic_search_matches: int = 0,
     ) -> dict[str, Any]:
         kept = []
         filtered = []
@@ -698,6 +896,9 @@ class LlmTriageService:
                 "additional_findings": kept_additional_findings,
                 "omitted_findings": omitted_after_retry,
                 "threat_model_provided": threat_model_provided,
+                "dynamic_repo_search_rounds": dynamic_search_rounds,
+                "dynamic_repo_search_requests": dynamic_search_requests,
+                "dynamic_repo_search_matches": dynamic_search_matches,
                 "errors": errors,
             },
             "issues": kept,
@@ -854,7 +1055,7 @@ def _triage_chat_model_kwargs(usage_runtime, *, reasoning_effort=None) -> dict[s
 
 def _parse_triage_response(
     raw: Any, batch: list[_FindingRecord]
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     if hasattr(raw, "model_dump"):
         parsed = raw.model_dump()
     elif isinstance(raw, dict):
@@ -862,7 +1063,7 @@ def _parse_triage_response(
     else:
         parsed = parse_json_output(raw)
     if not isinstance(parsed, dict):
-        return {}, []
+        return {}, [], []
     decisions = parsed.get("decisions")
     if not isinstance(decisions, list):
         decisions = []
@@ -887,7 +1088,19 @@ def _parse_triage_response(
             "exploitability": str(item.get("exploitability") or "").strip(),
         }
     additions = _parse_additional_findings(parsed.get("additional_findings"))
-    return normalized, additions
+    search_requests = _parse_repo_search_requests(parsed.get("repo_search_requests"))
+    return normalized, additions, search_requests
+
+
+def _parse_repo_search_requests(raw_items) -> list[dict[str, Any]]:
+    if not isinstance(raw_items, list):
+        return []
+    requests: list[dict[str, Any]] = []
+    for item in raw_items:
+        cleaned = _clean_dynamic_search_request(item)
+        if cleaned is not None:
+            requests.append(cleaned)
+    return requests
 
 
 def _parse_additional_findings(raw_items) -> list[dict[str, Any]]:
@@ -1720,6 +1933,143 @@ def _is_additional_issue(issue: dict[str, Any]) -> bool:
     return str(issue.get("id") or "").startswith("A")
 
 
+_DYNAMIC_SEARCH_GENERIC_TERMS = _STOPWORDS | {
+    "access",
+    "alloc",
+    "allocation",
+    "array",
+    "bug",
+    "cache",
+    "call",
+    "calls",
+    "check",
+    "cleanup",
+    "copy",
+    "data",
+    "error",
+    "file",
+    "free",
+    "function",
+    "info",
+    "input",
+    "issue",
+    "lock",
+    "memory",
+    "null",
+    "object",
+    "page",
+    "pages",
+    "path",
+    "pointer",
+    "queue",
+    "read",
+    "return",
+    "state",
+    "struct",
+    "user",
+    "write",
+}
+
+
+def _dynamic_search_status(
+    round_index: int,
+    rounds_used: int,
+    total_requests: int,
+    total_matches: int,
+) -> str:
+    remaining_rounds = max(
+        0, DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_ROUNDS - int(round_index or 0)
+    )
+    remaining_matches = max(
+        0, DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_TOTAL_MATCHES - total_matches
+    )
+    return (
+        f"round={round_index}; rounds_used={rounds_used}; "
+        f"remaining_rounds={remaining_rounds}; "
+        f"max_requests_per_round="
+        f"{DEFAULT_LLM_TRIAGE_DYNAMIC_SEARCH_MAX_REQUESTS_PER_ROUND}; "
+        f"remaining_total_matches={remaining_matches}; "
+        "request searches only for exact symbols/strings needed to decide."
+    )
+
+
+def _dynamic_repo_evidence_json(evidence: list[dict[str, Any]]) -> str:
+    if not evidence:
+        return "[]"
+    return json.dumps(evidence, indent=2)
+
+
+def _clean_dynamic_search_request(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    query = _clean_dynamic_search_query(
+        item.get("query")
+        or item.get("symbol")
+        or item.get("term")
+        or item.get("search")
+    )
+    if not query:
+        return None
+    path_prefix = _clean_dynamic_path_prefix(
+        item.get("path_prefix") or item.get("scope") or item.get("directory")
+    )
+    finding_ids = []
+    raw_ids = item.get("finding_ids") or item.get("ids") or []
+    if isinstance(raw_ids, str):
+        raw_ids = [raw_ids]
+    if isinstance(raw_ids, (list, tuple, set)):
+        for finding_id in raw_ids[:8]:
+            text = str(finding_id or "").strip()
+            if re.fullmatch(r"[FA]\d{3}", text):
+                finding_ids.append(text)
+    return {
+        "query": query,
+        "reason": str(item.get("reason") or item.get("why") or "").strip()[:240],
+        "path_prefix": path_prefix,
+        "finding_ids": finding_ids,
+    }
+
+
+def _clean_dynamic_search_query(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip("`'\"")
+    if len(text) > 120:
+        return ""
+    lowered = text.lower()
+    if lowered in _DYNAMIC_SEARCH_GENERIC_TERMS:
+        return ""
+    if lowered.startswith("cwe-"):
+        return ""
+    if len(text) < 4:
+        return ""
+    if "\n" in text or "\r" in text:
+        return ""
+    if len(text.split()) > 6:
+        return ""
+    # Prefer exact identifiers/strings. Pure prose words need to be distinctive.
+    if (
+        re.fullmatch(r"[A-Za-z]+", text)
+        and "_" not in text
+        and len(text) < 9
+        and lowered not in {"ioctl", "mmap", "munmap", "debugfs", "sysfs"}
+    ):
+        return ""
+    return text
+
+
+def _clean_dynamic_path_prefix(value: Any) -> str:
+    text = str(value or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    text = text.strip("/").lstrip("./")
+    if ".." in text.split("/"):
+        return ""
+    return text[:240]
+
+
 def _search_queries_for_issue(issue: dict[str, Any]) -> list[str]:
     candidates: list[str] = []
 
@@ -1826,7 +2176,52 @@ def _search_codebase(
     return matches
 
 
-def _iter_search_files(codebase_path: str):
+def _search_codebase_context(
+    codebase_path: str,
+    query: str,
+    *,
+    path_prefix: str = "",
+    max_matches: int,
+    context_lines: int,
+    max_context_chars: int,
+) -> list[dict[str, Any]]:
+    query = str(query or "").strip()
+    if not query or max_matches <= 0:
+        return []
+    query_key = query.lower()
+    matches: list[dict[str, Any]] = []
+    for rel_file, abs_file in _iter_search_files(codebase_path, path_prefix=path_prefix):
+        try:
+            with open(abs_file, "r", encoding="utf-8", errors="ignore") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+        for index, line in enumerate(lines):
+            if query_key not in line.lower():
+                continue
+            start = max(0, index - context_lines)
+            end = min(len(lines), index + context_lines + 1)
+            context = "".join(
+                f"{line_no}: {lines[line_no - 1]}"
+                for line_no in range(start + 1, end + 1)
+            ).strip()
+            if len(context) > max_context_chars:
+                context = context[:max_context_chars].rstrip() + "\n...[truncated]"
+            matches.append(
+                {
+                    "file": rel_file,
+                    "line_number": index + 1,
+                    "line": line.strip()[:240],
+                    "context": context,
+                }
+            )
+            if len(matches) >= max_matches:
+                return matches
+    return matches
+
+
+def _iter_search_files(codebase_path: str, *, path_prefix: str = ""):
+    normalized_prefix = str(path_prefix or "").replace("\\", "/").strip("/")
     for root, dirs, files in os.walk(codebase_path):
         dirs[:] = [
             dirname
@@ -1839,4 +2234,7 @@ def _iter_search_files(codebase_path: str):
                 continue
             abs_file = os.path.join(root, file_name)
             rel_file = os.path.relpath(abs_file, codebase_path).replace("\\", "/")
+            if normalized_prefix and not rel_file.startswith(normalized_prefix + "/"):
+                if rel_file != normalized_prefix:
+                    continue
             yield rel_file, abs_file

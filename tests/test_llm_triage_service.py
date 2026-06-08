@@ -20,6 +20,8 @@ def test_llm_triage_prompt_uses_metis_priority_rubric():
     assert "p5: Metis-only filtered state" in prompt
     assert "second recovery pass" in prompt
     assert "additional_findings" in prompt
+    assert "repo_search_requests" in llm_triage_service._TRIAGE_USER_PROMPT
+    assert "exact function names" in llm_triage_service._TRIAGE_USER_PROMPT
 
 
 def test_llm_triage_filters_p5_and_sorts_priorities(monkeypatch, tmp_path):
@@ -697,6 +699,122 @@ void missed(char *dst, char *src) { strcpy(dst, src); }
     assert [issue["id"] for issue in payload["issues"]] == ["A001", "F001"]
     assert payload["issues"][0]["priority"] == "p1"
     assert payload["issues"][0]["llm_triage_source"] == "additional_finding"
+
+
+def test_llm_triage_dynamic_repo_search_followup(monkeypatch, tmp_path):
+    source = tmp_path / "driver.c"
+    source.write_text(
+        """
+int reported(void) {
+    return 0;
+}
+""".strip(),
+        encoding="utf-8",
+    )
+    kernel_dir = tmp_path / "product" / "kernel"
+    kernel_dir.mkdir(parents=True)
+    (kernel_dir / "entry.c").write_text(
+        """
+int entry_ioctl(int cmd) {
+    return risky_dispatch(cmd);
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    def _fake_invoke(_provider, _usage_runtime, **kwargs):
+        calls.append(kwargs)
+        variables = kwargs["variables"]
+        if len(calls) == 1:
+            assert variables["dynamic_repo_evidence"] == "[]"
+            return json.dumps(
+                {
+                    "repo_search_requests": [
+                        {
+                            "query": "entry_ioctl",
+                            "path_prefix": "product/kernel",
+                            "reason": "Find the ioctl entry path.",
+                            "finding_ids": ["F001"],
+                        }
+                    ]
+                }
+            )
+
+        evidence = json.loads(variables["dynamic_repo_evidence"])
+        assert evidence[0]["query"] == "entry_ioctl"
+        assert evidence[0]["matches"][0]["file"] == "product/kernel/entry.c"
+        assert "entry_ioctl" in evidence[0]["matches"][0]["context"]
+        return json.dumps(
+            {
+                "decisions": [
+                    {
+                        "id": "F001",
+                        "priority": "p2",
+                        "keep": True,
+                        "duplicate_of": None,
+                        "reason": "Search evidence shows the reported path is ioctl reachable.",
+                        "exploitability": "Attacker controls cmd through entry_ioctl.",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(llm_triage_service, "_invoke_triage_prompt", _fake_invoke)
+
+    service = LlmTriageService(
+        codebase_path=tmp_path,
+        llm_provider=object(),
+        usage_runtime=SimpleNamespace(),
+    )
+    payload = service.triage_review_results(
+        {
+            "reviews": [
+                {
+                    "file": "driver.c",
+                    "file_path": str(source),
+                    "reviews": [
+                        {
+                            "issue": "Reported issue needs path context",
+                            "line_number": 2,
+                            "primary_file": "driver.c",
+                            "primary_function": "reported",
+                            "severity": "High",
+                            "confidence": 0.95,
+                            "reasoning": "Potential risky dispatch.",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    assert len(calls) == 2
+    assert payload["summary"]["dynamic_repo_search_rounds"] == 1
+    assert payload["summary"]["dynamic_repo_search_requests"] == 1
+    assert payload["summary"]["dynamic_repo_search_matches"] == 1
+    assert payload["issues"][0]["id"] == "F001"
+    assert payload["issues"][0]["priority"] == "p2"
+
+
+def test_llm_triage_rejects_generic_dynamic_repo_search_requests():
+    requests = llm_triage_service._parse_repo_search_requests(
+        [
+            {"query": "lock", "reason": "too broad"},
+            {"query": "CWE-416", "reason": "not useful"},
+            {"query": "kbase_csf_queue_group_suspend_prepare"},
+        ]
+    )
+
+    assert requests == [
+        {
+            "query": "kbase_csf_queue_group_suspend_prepare",
+            "reason": "",
+            "path_prefix": "",
+            "finding_ids": [],
+        }
+    ]
 
 
 def test_llm_triage_collapses_duplicate_root_causes_kept_by_model(
