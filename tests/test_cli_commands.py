@@ -416,6 +416,10 @@ def test_finalize_review_output_saves_llm_triaged_review_report(
                     "kept_input_findings": 1,
                     "filtered_findings": 1,
                     "additional_findings": 0,
+                    "dynamic_repo_search_rounds": 1,
+                    "dynamic_repo_search_requests": 1,
+                    "dynamic_repo_search_matches": 2,
+                    "dynamic_repo_search_insights": 1,
                     "errors": [],
                 },
                 "issues": [
@@ -438,6 +442,35 @@ def test_finalize_review_output_saves_llm_triaged_review_report(
                         "line_number": 9,
                         "issue": "Filtered issue",
                         "llm_triage_reason": "Duplicate.",
+                    }
+                ],
+                "dynamic_repo_checks": [
+                    {
+                        "batch": 1,
+                        "round": 1,
+                        "query": "entry_ioctl",
+                        "path_prefix": "drivers/gpu",
+                        "reason": "Confirm user entry path.",
+                        "finding_ids": ["F001"],
+                        "match_count": 2,
+                        "truncated": False,
+                        "matches": [
+                            {
+                                "file": "drivers/gpu/entry.c",
+                                "line_number": 12,
+                                "line": "entry_ioctl(cmd);",
+                            }
+                        ],
+                    }
+                ],
+                "dynamic_repo_insights": [
+                    {
+                        "query": "entry_ioctl",
+                        "finding_ids": ["F001"],
+                        "insight": "entry_ioctl reaches the reviewed helper.",
+                        "impact": "supports_reachability",
+                        "batch": 1,
+                        "round": 1,
                     }
                 ],
             }
@@ -495,6 +528,36 @@ def test_finalize_review_output_saves_llm_triaged_review_report(
     saved = captured["saved"]
     assert saved == captured["printed"]
     assert saved["llm_triage_summary"]["filtered_findings"] == 1
+    assert saved["llm_triage_summary"]["dynamic_repo_search_requests"] == 1
+    assert saved["dynamic_repo_checks"] == [
+        {
+            "batch": 1,
+            "round": 1,
+            "query": "entry_ioctl",
+            "path_prefix": "drivers/gpu",
+            "reason": "Confirm user entry path.",
+            "finding_ids": ["F001"],
+            "match_count": 2,
+            "truncated": False,
+            "matches": [
+                {
+                    "file": "drivers/gpu/entry.c",
+                    "line_number": 12,
+                    "line": "entry_ioctl(cmd);",
+                }
+            ],
+        }
+    ]
+    assert saved["dynamic_repo_insights"] == [
+        {
+            "query": "entry_ioctl",
+            "finding_ids": ["F001"],
+            "insight": "entry_ioctl reaches the reviewed helper.",
+            "impact": "supports_reachability",
+            "batch": 1,
+            "round": 1,
+        }
+    ]
     assert saved["reviews"] == [
         {
             "file": "a.c",

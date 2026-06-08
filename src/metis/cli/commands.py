@@ -520,10 +520,17 @@ def _llm_triage_failure_payload(
             "filtered_findings": len(filtered_issues),
             "additional_findings": 0,
             "omitted_findings": 0,
+            "threat_model_provided": False,
+            "dynamic_repo_search_rounds": 0,
+            "dynamic_repo_search_requests": 0,
+            "dynamic_repo_search_matches": 0,
+            "dynamic_repo_search_insights": 0,
             "errors": [{"phase": phase, "error": error}],
         },
         "issues": [],
         "filtered_issues": filtered_issues,
+        "dynamic_repo_checks": [],
+        "dynamic_repo_insights": [],
     }
 
 
@@ -605,6 +612,14 @@ def _review_results_from_llm_triage_payload(results: dict, payload: dict | None)
     final_results["llm_triage_summary"] = copy.deepcopy(payload.get("summary") or {})
     final_results["llm_triage_filtered_issues"] = copy.deepcopy(
         filtered_issues if isinstance(filtered_issues, list) else []
+    )
+    dynamic_repo_checks = payload.get("dynamic_repo_checks")
+    final_results["dynamic_repo_checks"] = copy.deepcopy(
+        dynamic_repo_checks if isinstance(dynamic_repo_checks, list) else []
+    )
+    dynamic_repo_insights = payload.get("dynamic_repo_insights")
+    final_results["dynamic_repo_insights"] = copy.deepcopy(
+        dynamic_repo_insights if isinstance(dynamic_repo_insights, list) else []
     )
     return final_results
 

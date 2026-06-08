@@ -20,9 +20,12 @@ def test_llm_triage_prompt_uses_metis_priority_rubric():
     assert "p5: Metis-only filtered state" in prompt
     assert "second recovery pass" in prompt
     assert "additional_findings" in prompt
+    assert "different concrete security bug" in prompt
+    assert "Before filtering a high- or medium-severity driver/kernel finding" in prompt
     assert "repo_search_requests" in llm_triage_service._TRIAGE_USER_PROMPT
     assert "repo_search_insights" in llm_triage_service._TRIAGE_USER_PROMPT
     assert "exact function names" in llm_triage_service._TRIAGE_USER_PROMPT
+    assert "Always inspect the provided code context" in llm_triage_service._TRIAGE_USER_PROMPT
 
 
 def test_llm_triage_filters_p5_and_sorts_priorities(monkeypatch, tmp_path):
@@ -669,6 +672,9 @@ void missed(char *dst, char *src) { strcpy(dst, src); }
                         "severity": "High",
                         "confidence": 0.9,
                         "cwe": "CWE-120",
+                        "primary_function": "missed",
+                        "path": ["driver.c::entry", "driver.c::missed"],
+                        "exploitability": "User-controlled src reaches missed.",
                         "reasoning": "Provided code shows strcpy from attacker data.",
                         "mitigation": "Use a bounded copy and validate lengths.",
                     }
@@ -700,6 +706,12 @@ void missed(char *dst, char *src) { strcpy(dst, src); }
     assert [issue["id"] for issue in payload["issues"]] == ["A001", "F001"]
     assert payload["issues"][0]["priority"] == "p1"
     assert payload["issues"][0]["llm_triage_source"] == "additional_finding"
+    assert payload["issues"][0]["primary_function"] == "missed"
+    assert payload["issues"][0]["path"] == ["driver.c::entry", "driver.c::missed"]
+    assert (
+        payload["issues"][0]["llm_triage_exploitability"]
+        == "User-controlled src reaches missed."
+    )
 
 
 def test_llm_triage_dynamic_repo_search_followup(monkeypatch, tmp_path):

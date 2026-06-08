@@ -95,7 +95,10 @@ You are a senior security triage reviewer for C/C++ and systems code.
 Triage the supplied security review findings as exploitable vulnerability candidates.
 You are not the original reporter. Your job is to reduce noise and keep only the
 strongest independent security bugs. Use the code context, path context, evidence,
-severity, and reasoning. Be strict.
+severity, and reasoning. Be strict, but do not limit yourself to validating the
+reported text. If the supplied code context or dynamically retrieved repo evidence
+proves a different concrete security bug in the same function, nearby path, or
+same lifecycle/state machine, report it under additional_findings.
 
 If a project threat model is supplied, use it as authoritative project-specific
 security scope. Findings that match attacker capabilities, APIs, data flows, or
@@ -115,6 +118,11 @@ or distinctive error strings only. Never request broad generic terms such as "lo
 "queue", "memory", "user", "error", or a CWE alone. If search results are too broad,
 request a narrower exact symbol or a path_prefix. Once search budget is exhausted,
 return final decisions from the evidence available.
+Before filtering a high- or medium-severity driver/kernel finding solely because
+caller reachability or attacker control is missing, request a narrow repository
+search for the exact primary function, ioctl/sysfs/debugfs entry point, callback,
+struct field, or distinctive helper that would prove or refute that path, unless
+the supplied context already proves the decision.
 
 Metis default priority rubric:
 - p0: emergency response. Reserve this for an issue that can take down the service,
@@ -183,6 +191,7 @@ Output schema:
       "severity": "High",
       "confidence": 0.85,
       "cwe": "CWE-120",
+      "exploitability": "Required attacker control and prerequisites.",
       "reasoning": "Why this is a real issue, tied to provided code/search evidence.",
       "mitigation": "Concrete fix."
     }}
@@ -215,11 +224,14 @@ When Dynamic repo evidence affects a keep/filter/additional finding decision, in
 repo_search_insights that concisely state what the retrieved evidence proved or ruled
 out. If the search did not help, say it was inconclusive.
 
-Only add additional_findings when the provided code context or repo search evidence directly
-supports a real security issue not already represented by an input finding. Do not speculate
-from names alone. When a threat model is supplied, actively check whether a filtered or
-near-miss input finding reveals a different concrete in-scope bug in the shown evidence,
-then add that exact root cause as an additional finding instead of returning no signal.
+Always inspect the provided code context and any Dynamic repo evidence for independent
+security bugs that are not already represented by the input findings. Add such a bug
+under additional_findings when the evidence directly proves the vulnerable line, root
+cause, and realistic attacker influence. Do not speculate from names alone, and do not
+add hardening-only or reliability-only issues. When a threat model is supplied, actively
+check whether a filtered or near-miss input finding reveals a different concrete in-scope
+bug in the shown evidence, then add that exact root cause as an additional finding
+instead of returning no signal.
 
 {threat_model}
 
@@ -1226,7 +1238,13 @@ def _parse_additional_findings(raw_items) -> list[dict[str, Any]]:
                 "severity": str(item.get("severity") or "Medium").strip(),
                 "confidence": _confidence_value(item.get("confidence") or 0.75),
                 "cwe": item.get("cwe"),
+                "primary_function": str(item.get("primary_function") or "").strip(),
+                "analysis_type": str(
+                    item.get("analysis_type") or "llm_triage_additional"
+                ).strip(),
+                "path": _clean_path_list(item.get("path")),
                 "reasoning": str(item.get("reasoning") or "").strip(),
+                "exploitability": str(item.get("exploitability") or "").strip(),
                 "mitigation": str(item.get("mitigation") or "").strip(),
             }
         )
@@ -1493,10 +1511,17 @@ def _failure_payload(
             "filtered_findings": len(filtered_issues),
             "additional_findings": 0,
             "omitted_findings": 0,
+            "threat_model_provided": False,
+            "dynamic_repo_search_rounds": 0,
+            "dynamic_repo_search_requests": 0,
+            "dynamic_repo_search_matches": 0,
+            "dynamic_repo_search_insights": 0,
             "errors": [{"phase": phase, "error": error}],
         },
         "issues": [],
         "filtered_issues": filtered_issues,
+        "dynamic_repo_checks": [],
+        "dynamic_repo_insights": [],
     }
 
 
@@ -1519,10 +1544,20 @@ def _additional_issue(
         "severity": str(additional.get("severity") or "Medium").strip() or "Medium",
         "confidence": _confidence_value(additional.get("confidence")),
         "cwe": additional.get("cwe"),
+        "primary_file": file_name.lstrip("./"),
+        "primary_function": str(additional.get("primary_function") or "").strip(),
+        "analysis_type": str(
+            additional.get("analysis_type") or "llm_triage_additional"
+        ).strip(),
+        "path": list(additional.get("path") or []),
         "reasoning": str(additional.get("reasoning") or "").strip(),
         "mitigation": str(additional.get("mitigation") or "").strip(),
         "llm_triage_reason": "Additional finding identified during LLM triage.",
-        "llm_triage_exploitability": str(additional.get("reasoning") or "").strip(),
+        "llm_triage_exploitability": str(
+            additional.get("exploitability")
+            or additional.get("reasoning")
+            or ""
+        ).strip(),
         "llm_triage_duplicate_of": None,
         "llm_triage_source": "additional_finding",
     }
@@ -1613,6 +1648,19 @@ def _clean_optional_text(value: Any) -> str | None:
     if not text or text.lower() in {"none", "null", "false"}:
         return None
     return text
+
+
+def _clean_path_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    paths = []
+    for item in list(value)[:12]:
+        text = str(item or "").strip()
+        if text:
+            paths.append(text[:240])
+    return paths
 
 
 def _confidence_value(value: Any) -> float:
