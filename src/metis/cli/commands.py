@@ -604,24 +604,74 @@ def _review_results_from_llm_triage_payload(results: dict, payload: dict | None)
             )
 
     final_results = copy.deepcopy(results) if isinstance(results, dict) else {}
-    final_results["reviews"] = [
+    llm_triage_summary = copy.deepcopy(payload.get("summary") or {})
+    dynamic_repo_checks = payload.get("dynamic_repo_checks")
+    copied_dynamic_repo_checks = copy.deepcopy(
+        dynamic_repo_checks if isinstance(dynamic_repo_checks, list) else []
+    )
+    dynamic_repo_insights = payload.get("dynamic_repo_insights")
+    copied_dynamic_repo_insights = copy.deepcopy(
+        dynamic_repo_insights if isinstance(dynamic_repo_insights, list) else []
+    )
+    final_reviews = [
         entry
         for entry in grouped.values()
         if entry.get("reviews") or entry.get("llm_triage_filtered_reviews")
     ]
-    final_results["llm_triage_summary"] = copy.deepcopy(payload.get("summary") or {})
+    for entry in final_reviews:
+        entry["llm_triage_summary"] = copy.deepcopy(llm_triage_summary)
+        entry_ids = _file_entry_finding_ids(entry)
+        entry["dynamic_repo_checks"] = _dynamic_records_for_entry(
+            copied_dynamic_repo_checks,
+            entry_ids,
+        )
+        entry["dynamic_repo_insights"] = _dynamic_records_for_entry(
+            copied_dynamic_repo_insights,
+            entry_ids,
+        )
+
+    final_results["reviews"] = final_reviews
+    final_results["llm_triage_summary"] = llm_triage_summary
     final_results["llm_triage_filtered_issues"] = copy.deepcopy(
         filtered_issues if isinstance(filtered_issues, list) else []
     )
-    dynamic_repo_checks = payload.get("dynamic_repo_checks")
-    final_results["dynamic_repo_checks"] = copy.deepcopy(
-        dynamic_repo_checks if isinstance(dynamic_repo_checks, list) else []
-    )
-    dynamic_repo_insights = payload.get("dynamic_repo_insights")
-    final_results["dynamic_repo_insights"] = copy.deepcopy(
-        dynamic_repo_insights if isinstance(dynamic_repo_insights, list) else []
-    )
+    final_results["dynamic_repo_checks"] = copied_dynamic_repo_checks
+    final_results["dynamic_repo_insights"] = copied_dynamic_repo_insights
     return final_results
+
+
+def _file_entry_finding_ids(entry: dict) -> set[str]:
+    finding_ids: set[str] = set()
+    for key in ("reviews", "llm_triage_filtered_reviews"):
+        issues = entry.get(key)
+        if not isinstance(issues, list):
+            continue
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            finding_id = str(issue.get("id") or "").strip()
+            if finding_id:
+                finding_ids.add(finding_id)
+    return finding_ids
+
+
+def _dynamic_records_for_entry(records: list[dict], finding_ids: set[str]) -> list[dict]:
+    if not finding_ids:
+        return []
+    selected = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        raw_ids = record.get("finding_ids")
+        if isinstance(raw_ids, str):
+            record_ids = {raw_ids}
+        elif isinstance(raw_ids, (list, tuple, set)):
+            record_ids = {str(item) for item in raw_ids if str(item or "").strip()}
+        else:
+            record_ids = set()
+        if not record_ids or record_ids & finding_ids:
+            selected.append(copy.deepcopy(record))
+    return selected
 
 
 def _finalize_review_output(engine, results, args, runtime: CommandRuntime):
